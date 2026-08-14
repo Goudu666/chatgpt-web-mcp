@@ -1,0 +1,10 @@
+node_modules/
+test/
+.github/
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+*.png
+coverage/

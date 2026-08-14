@@ -1,0 +1,52 @@
+{
+  "name": "chatgpt-web-mcp",
+  "version": "0.2.0",
+  "type": "module",
+  "description": "A local MCP server that controls the ChatGPT web UI through a persistent browser profile.",
+  "license": "MIT",
+  "author": "Goudu66",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Goudu666/chatgpt-web-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Goudu666/chatgpt-web-mcp/issues"
+  },
+  "homepage": "https://github.com/Goudu666/chatgpt-web-mcp#readme",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "codex",
+    "chatgpt",
+    "browser-automation"
+  ],
+  "bin": {
+    "chatgpt-web-mcp": "./src/cli.js"
+  },
+  "files": [
+    "src",
+    "scripts",
+    "README.md",
+    "README.en.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    ".env.example",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node src/index.js",
+    "login": "node scripts/login.js",
+    "inspect": "node scripts/inspect.js",
+    "doctor": "node scripts/doctor.js",
+    "smoke": "node scripts/smoke-mcp.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.5",
+    "playwright-core": "^1.54.2",
+    "zod": "^3.25.76"
+  }
+}

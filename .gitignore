@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+.env
+.env.*
+!.env.example
+*.log
+*.jsonl
+*.png
+coverage/
+chrome-profile/
+browser-state.json
+runtime-state.json
+browser-operation.lock

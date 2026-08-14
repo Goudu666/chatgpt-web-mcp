@@ -1,0 +1,132 @@
+export const SELECTORS = {
+  composer: [
+    "#prompt-textarea",
+    "[data-testid='prompt-textarea']",
+    "textarea[placeholder*='Message']",
+    "textarea[placeholder*='发送消息']",
+    "[contenteditable='true'][data-virtualkeyboard='true']",
+    "main [contenteditable='true']",
+  ],
+  sendButton: [
+    "button[data-testid='send-button']",
+    "button[aria-label='Send prompt']",
+    "button[aria-label='发送提示']",
+    "button[aria-label='Send message']",
+    "button[aria-label='发送消息']",
+  ],
+  stopButton: [
+    "button[data-testid='stop-button']",
+    "button[aria-label='Stop generating']",
+    "button[aria-label='Stop streaming']",
+    "button[aria-label='Stop response']",
+    "button[aria-label='停止生成']",
+    "button[aria-label='停止回答']",
+    "button[aria-label='停止响应']",
+  ],
+  assistantMessages: [
+    "[data-message-author-role='assistant']",
+    "article[data-turn='assistant']",
+  ],
+  userMessages: [
+    "[data-message-author-role='user']",
+    "article[data-turn='user']",
+  ],
+  fileInput: [
+    "input[type='file']",
+  ],
+  attachmentButton: [
+    "button[data-testid='composer-plus-btn']",
+    "button[aria-label*='Attach']",
+    "button[aria-label*='Upload']",
+    "button[aria-label*='添加']",
+    "button[aria-label*='上传']",
+  ],
+  uploadMenuItems: [
+    "[role='menuitem']:has-text('Add photos & files')",
+    "[role='menuitem']:has-text('Upload from computer')",
+    "[role='menuitem']:has-text('添加照片和文件')",
+    "[role='menuitem']:has-text('上传文件')",
+    "button:has-text('Add photos & files')",
+    "button:has-text('添加照片和文件')",
+  ],
+  modelButtons: [
+    "button[data-testid='model-switcher-dropdown-button']",
+    "button[aria-label*='Model selector']",
+    "button[aria-label*='模型选择']",
+  ],
+  modeButtons: [
+    "button[role='radio'][aria-checked]",
+    "[role='radiogroup'] button[role='radio']",
+  ],
+  advancedLabels: [
+    "高级",
+    "Advanced",
+  ],
+  modelRowLabels: [
+    "模型",
+    "Model",
+  ],
+  thinkingRowLabels: [
+    "思考强度",
+    "Thinking intensity",
+    "Thinking effort",
+    "Reasoning effort",
+  ],
+  thinkingSliders: [
+    "[role='slider']",
+    "input[type='range']",
+  ],
+  answerTierSliders: [
+    "[role='slider'][aria-valuetext*='能力']",
+    "[role='slider'][aria-label*='能力']",
+    "[role='slider'][aria-valuetext*='capability' i]",
+    "[role='slider'][aria-label*='capability' i]",
+    "[role='slider']",
+    "input[type='range']",
+  ],
+  temporaryChatButtons: [
+    "button[data-testid='temporary-chat-button']",
+    "button[aria-label*='Temporary chat']",
+    "button[aria-label*='临时对话']",
+    "button[aria-label*='临时聊天']",
+    "button:has-text('Temporary')",
+    "button:has-text('临时对话')",
+    "button:has-text('临时聊天')",
+  ],
+  newChatLinks: [
+    "a[data-testid='create-new-chat-button']",
+    "a[aria-label='New chat']",
+    "a[aria-label='新建聊天']",
+    "a[href='/']",
+  ],
+  historyLinks: [
+    "nav a[href^='/c/']",
+    "aside a[href^='/c/']",
+    "a[data-testid^='history-item-'][href^='/c/']",
+    "a[href^='/c/']",
+  ],
+  historySearchButtons: [
+    "button[data-testid='search-button']",
+    "button[aria-label='Search chats']",
+    "button[aria-label='搜索聊天']",
+    "button[aria-label='Search']",
+    "button[aria-label='搜索']",
+    "button:has-text('Search chats')",
+    "button:has-text('搜索聊天')",
+    "button:has-text('Search')",
+    "button:has-text('搜索')",
+  ],
+  historySearchInputs: [
+    "input[placeholder*='Search chats']",
+    "input[placeholder*='搜索聊天']",
+    "[role='dialog'] input",
+    "[role='dialog'] [contenteditable='true']",
+  ],
+};
+
+export const TEXT = {
+  login: ["Log in", "Sign up", "登录", "注册"],
+  temporary: ["Temporary", "Temporary Chat", "临时", "临时对话"],
+  newChat: ["New chat", "新聊天", "新建聊天", "开始新对话"],
+  uploadFinished: ["Upload complete", "已上传", "上传完成"],
+};
