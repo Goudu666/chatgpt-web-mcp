@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-web-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "A local MCP server that controls the ChatGPT web UI through a persistent browser profile.",
   "license": "MIT",

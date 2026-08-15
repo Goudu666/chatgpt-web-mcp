@@ -11,7 +11,7 @@ import {
   PROBE_FALLBACK_CLASSIFICATION,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
-  PRO_PROBE_CACHE_MS,
+  PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
   RESPONSE_TIMEOUT_MS,
 } from "./config.js";
 import { userFacingError } from "./errors.js";
@@ -19,10 +19,10 @@ import { userFacingError } from "./errors.js";
 const browser = new ChatGPTBrowser();
 const server = new McpServer({
   name: "chatgpt-web",
-  version: "0.2.0",
+  version: "0.2.1",
 }, {
   instructions:
-    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。新任务优先用 chatgpt_route_new_chat：普通请求使用配置的默认档位“${DEFAULT_ANSWER_TIER}”；用户明确要求 Pro 时，临时使用“${PRO_ANSWER_TIER}”并发送身份探针，接受分类为“${PROBE_ACCEPT_CLASSIFICATION}”，回退分类为“${PROBE_FALLBACK_CLASSIFICATION}”。匹配规则可通过环境变量配置。只有用户明确要求重新验证时才设置 forceProbe。`,
+    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。新任务优先用 chatgpt_route_new_chat：普通请求使用配置的默认档位“${DEFAULT_ANSWER_TIER}”；用户明确要求 Pro 时，临时使用“${PRO_ANSWER_TIER}”并发送身份探针，接受分类为“${PROBE_ACCEPT_CLASSIFICATION}”，回退分类为“${PROBE_FALLBACK_CLASSIFICATION}”。同一浏览器和 ChatGPT 页面会话内始终复用可靠探针；页面或浏览器关闭后保留结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
 });
 
 function asResult(value, isError = false) {
@@ -232,7 +232,7 @@ tool(
 
 tool(
   "chatgpt_probe_pro_identity",
-  `执行 Pro 身份探针：默认优先复用 ${Math.round(PRO_PROBE_CACHE_MS / 60_000)} 分钟内同模式的可靠结果；没有缓存时才新建临时对话、切到“${PRO_ANSWER_TIER}”、发送“${PROBE_PROMPT}”并无限等待。返回原回答及配置的接受/回退/unknown 分类，不创建正常对话。`,
+  `执行 Pro 身份探针：同一浏览器和 ChatGPT 页面会话内始终复用同模式的可靠结果；页面或浏览器关闭后继续复用 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。没有可用缓存时才新建临时对话、切到“${PRO_ANSWER_TIER}”、发送“${PROBE_PROMPT}”并无限等待。返回原回答及配置的接受/回退/unknown 分类，不创建正常对话。`,
   {
     mode: z.string().min(1).optional(),
     force: z.boolean().default(false).describe("true 表示忽略缓存并重新执行探针；仅在用户明确要求时使用。"),
@@ -247,7 +247,7 @@ tool(
     prompt: z.string().min(1).describe("最终正常对话要发送的实际提示词。"),
     files: z.array(z.string().min(1)).default([]),
     requestPro: z.boolean().default(false).describe("用户是否明确要求 Pro。"),
-    forceProbe: z.boolean().default(false).describe("是否忽略 30 分钟 Pro 探针缓存；默认 false。"),
+    forceProbe: z.boolean().default(false).describe("是否忽略会话级 Pro 探针缓存；仅在用户明确要求时设为 true。"),
     mode: z.string().min(1).optional(),
     wait: z.boolean().default(true),
     timeoutMs: z.number().int().min(5_000).max(900_000).default(RESPONSE_TIMEOUT_MS),

@@ -12,7 +12,7 @@
 - 写入提示词、上传文件、发送消息并读取完整回答
 - 新建普通或临时对话，选择历史对话
 - 动态读取和选择页面实际显示的模型、思考强度与能力档位
-- 使用可配置的临时身份探针决定是否在正常对话继续使用 Pro
+- 使用可配置的临时身份探针决定是否在正常对话继续使用 Pro，并在同一页面会话内持续复用可靠结果
 - 浏览器和 ChatGPT 页面默认常驻，工具结束后只断开本地控制连接
 - 跨进程串行操作、低频节流、回答完成后的切换静默期
 - 遇到页面限流文字或 HTTP 429 时立即熔断，不自动关闭提示或重试
@@ -101,12 +101,14 @@ chatgpt-web-mcp help     显示帮助
 
 普通请求默认新建非临时对话并选择“极高”。明确请求 Pro 时：
 
-1. 优先复用同模式下仍有效的身份探针缓存。
+1. 优先复用同模式下仍有效的身份探针缓存；只要专用浏览器和原 ChatGPT 页面没有关闭，就不按时间重复探针。
 2. 没有缓存时，新建临时对话并选择 Pro。
 3. 发送“你是什么模型？”，无限等待回答完成。
 4. 回答匹配 GPT-5.6 Pro 时，新建正常 Pro 对话。
 5. 回答匹配 GPT-5.5 mini 时，新建正常“极高”对话。
 6. 其他回答停止，不创建正常对话。
+
+如果专用浏览器或原 ChatGPT 页面中途关闭，已有可靠结果会先继续复用 3 小时；3 小时后发起下一次 Pro 请求时才重新验证。普通 MCP 调用结束只断开本地控制连接，不关闭页面，因此不会触发重新验证计时。无法确定手动关闭的准确时刻时，从首次检测到会话中断开始计算，以减少额外请求。
 
 以上是默认值，不是写死的账号假设。可通过环境变量替换：
 
@@ -119,6 +121,7 @@ chatgpt-web-mcp help     显示帮助
 | `CHATGPT_WEB_PROBE_FALLBACK_ID` | `gpt-5.5-mini` | 回退分类标识 |
 | `CHATGPT_WEB_PROBE_ACCEPT_PATTERN` | GPT-5.6 Pro 正则 | 接受回答的匹配表达式 |
 | `CHATGPT_WEB_PROBE_FALLBACK_PATTERN` | GPT-5.5 mini 正则 | 回退回答的匹配表达式 |
+| `CHATGPT_WEB_PRO_RECHECK_AFTER_CLOSE_MS` | `10800000` | 页面或浏览器关闭后，重新验证前继续复用可靠结果的时间 |
 
 参考配置见 [.env.example](.env.example)。项目不会自动读取 `.env`；请通过 MCP 客户端、Shell 或系统环境注入变量。
 
@@ -147,7 +150,7 @@ chatgpt-web-mcp help     显示帮助
 - `CHATGPT_WEB_RESPONSE_TIMEOUT_MS`：普通档位回答超时
 - `CHATGPT_WEB_RECONNECT_DELAY_MS`：浏览器异常重连间隔
 - `CHATGPT_WEB_AUTH_CACHE_MS`：登录状态本地缓存时间
-- `CHATGPT_WEB_PRO_PROBE_CACHE_MS`：可靠探针缓存时间
+- `CHATGPT_WEB_PRO_RECHECK_AFTER_CLOSE_MS`：页面或浏览器关闭后的探针重验间隔，默认 3 小时
 - `CHATGPT_WEB_BROWSER_STATE`、`CHATGPT_WEB_RUNTIME_STATE`：本地状态文件
 - `CHATGPT_WEB_OPERATION_LOCK`：跨进程浏览器独占锁
 - `CHATGPT_WEB_NETWORK_LOG`：脱敏网络异常日志

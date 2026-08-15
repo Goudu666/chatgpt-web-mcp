@@ -117,8 +117,8 @@ export const AUTH_CACHE_MS = Number(
   process.env.CHATGPT_WEB_AUTH_CACHE_MS || 10 * 60_000,
 );
 
-export const PRO_PROBE_CACHE_MS = Number(
-  process.env.CHATGPT_WEB_PRO_PROBE_CACHE_MS || 30 * 60_000,
+export const PRO_PROBE_RECHECK_AFTER_CLOSE_MS = Number(
+  process.env.CHATGPT_WEB_PRO_RECHECK_AFTER_CLOSE_MS || 3 * 60 * 60_000,
 );
 
 export const DEFAULT_ANSWER_TIER =

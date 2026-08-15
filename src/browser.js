@@ -28,7 +28,7 @@ import {
   PROBE_POLICY_KEY,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
-  PRO_PROBE_CACHE_MS,
+  PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
   RECONNECT_DELAY_MS,
   RESPONSE_TIMEOUT_MS,
   RUNTIME_LOCK_FILE,
@@ -204,8 +204,16 @@ export function siteActionWaitMs(
   );
 }
 
-export function validProbeCache(value, { mode, now = Date.now() } = {}) {
-  if (!value || Number(value.expiresAt) <= now) return null;
+export function validProbeCache(
+  value,
+  {
+    mode,
+    session = {},
+    now = Date.now(),
+    recheckAfterCloseMs = PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+  } = {},
+) {
+  if (!value) return null;
   if (value.policyKey !== PROBE_POLICY_KEY) return null;
   if (
     ![PROBE_ACCEPT_CLASSIFICATION, PROBE_FALLBACK_CLASSIFICATION].includes(
@@ -215,7 +223,62 @@ export function validProbeCache(value, { mode, now = Date.now() } = {}) {
     return null;
   }
   if (normalize(value.mode) !== normalize(mode)) return null;
-  return value;
+
+  const browserSessionId = String(session.browserSessionId || "");
+  const chatgptPageId = String(session.chatgptPageId || "");
+  const legacySessionCanBind =
+    !value.browserSessionId &&
+    Number(session.browserStartedAt || 0) > 0 &&
+    Number(session.browserStartedAt) <= Number(value.checkedAt || 0);
+  const sameBrowserSession = value.browserSessionId
+    ? value.browserSessionId === browserSessionId
+    : legacySessionCanBind;
+  const sameChatGPTPage = value.chatgptPageId
+    ? value.chatgptPageId === chatgptPageId
+    : legacySessionCanBind;
+
+  if (
+    session.browserRunning &&
+    session.chatgptPageOpen &&
+    sameBrowserSession &&
+    sameChatGPTPage
+  ) {
+    if (
+      value.browserSessionId === browserSessionId &&
+      value.chatgptPageId === chatgptPageId &&
+      !value.sessionInterruptedAt &&
+      !value.recheckAfter &&
+      value.expiresAt == null
+    ) {
+      return value;
+    }
+    return {
+      ...value,
+      browserSessionId,
+      chatgptPageId,
+      sessionInterruptedAt: null,
+      recheckAfter: null,
+      expiresAt: null,
+    };
+  }
+
+  const sessionInterruptedAt = Number(value.sessionInterruptedAt) || now;
+  const recheckAfter =
+    Number(value.recheckAfter) ||
+    sessionInterruptedAt + Number(recheckAfterCloseMs || 0);
+  if (now >= recheckAfter) return null;
+  if (
+    Number(value.sessionInterruptedAt) === sessionInterruptedAt &&
+    Number(value.recheckAfter) === recheckAfter
+  ) {
+    return value;
+  }
+  return {
+    ...value,
+    sessionInterruptedAt,
+    recheckAfter,
+    expiresAt: recheckAfter,
+  };
 }
 
 export function redactDiagnosticPath(value) {
@@ -344,6 +407,49 @@ async function chromeEndpoint(port) {
     return response.ok ? endpoint : null;
   } catch {
     return null;
+  }
+}
+
+function browserSessionId(state) {
+  const startedAt = Number(state?.startedAt || 0);
+  if (!startedAt) return null;
+  return [startedAt, Number(state?.pid || 0), Number(state?.port || 0)].join(":");
+}
+
+async function browserSessionSnapshot() {
+  const state = await readBrowserState();
+  const port = Number(state?.port);
+  const snapshot = {
+    browserRunning: false,
+    browserStartedAt: Number(state?.startedAt || 0) || null,
+    browserSessionId: browserSessionId(state),
+    chatgptPageOpen: false,
+    chatgptPageId: null,
+  };
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return snapshot;
+
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/list`);
+    if (!response.ok) return snapshot;
+    const targets = await response.json();
+    const chatgptPage = Array.isArray(targets)
+      ? targets.find((target) => {
+          if (target?.type !== "page") return false;
+          try {
+            return /(^|\.)chatgpt\.com$/i.test(new URL(target.url).hostname);
+          } catch {
+            return false;
+          }
+        })
+      : null;
+    return {
+      ...snapshot,
+      browserRunning: true,
+      chatgptPageOpen: Boolean(chatgptPage),
+      chatgptPageId: chatgptPage?.id || null,
+    };
+  } catch {
+    return snapshot;
   }
 }
 
@@ -958,7 +1064,7 @@ export class ChatGPTBrowser {
           startedAt: Date.now(),
           profile: USER_DATA_DIR,
         });
-        await updateRuntimeState({ authenticatedUntil: 0, proProbe: null });
+        await updateRuntimeState({ authenticatedUntil: 0 });
       }
     } catch (error) {
       await writeBrowserState({
@@ -1023,6 +1129,7 @@ export class ChatGPTBrowser {
       postResponseConversationCooldownMs: POST_RESPONSE_CONVERSATION_COOLDOWN_MS,
       postBreakerCooldownMs: POST_BREAKER_COOLDOWN_MS,
       historyQuietPeriodMs: HISTORY_QUIET_PERIOD_MS,
+      proProbeRecheckAfterCloseMs: PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
       pid: state?.pid || null,
       port: state?.port || null,
       lastSiteAction: runtime.lastSiteAction || null,
@@ -1042,9 +1149,27 @@ export class ChatGPTBrowser {
 
   async terminateBrowser() {
     const state = await readBrowserState();
+    const runtime = await readRuntimeState();
+    const closedAt = Date.now();
+    const reliableProbe =
+      runtime.proProbe?.policyKey === PROBE_POLICY_KEY &&
+      [PROBE_ACCEPT_CLASSIFICATION, PROBE_FALLBACK_CLASSIFICATION].includes(
+        runtime.proProbe?.classification,
+      )
+        ? {
+            ...runtime.proProbe,
+            sessionInterruptedAt: closedAt,
+            recheckAfter: closedAt + PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+            expiresAt: closedAt + PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+          }
+        : null;
     await this.close({ terminateBrowser: true });
-    await updateRuntimeState({ authenticatedUntil: 0, proProbe: null });
-    return { closed: true, pid: state?.pid || null };
+    await updateRuntimeState({ authenticatedUntil: 0, proProbe: reliableProbe });
+    return {
+      closed: true,
+      pid: state?.pid || null,
+      proProbeRecheckAfter: reliableProbe?.recheckAfter || null,
+    };
   }
 
   async page() {
@@ -2609,8 +2734,12 @@ export class ChatGPTBrowser {
   async probeProIdentity({ mode, force = false } = {}) {
     if (!force) {
       const runtime = await readRuntimeState();
-      const cached = validProbeCache(runtime.proProbe, { mode });
+      const session = await browserSessionSnapshot();
+      const cached = validProbeCache(runtime.proProbe, { mode, session });
       if (cached) {
+        if (cached !== runtime.proProbe) {
+          await updateRuntimeState({ proProbe: cached });
+        }
         return {
           prompt: PROBE_PROMPT,
           response: cached.response,
@@ -2619,9 +2748,13 @@ export class ChatGPTBrowser {
           answerTier: PRO_ANSWER_TIER,
           url: cached.url || null,
           waitPolicy: "cached-probe",
+          cachePolicy: cached.sessionInterruptedAt
+            ? "closed-page-grace"
+            : "same-page-session",
           cached: true,
           checkedAt: cached.checkedAt,
-          expiresAt: cached.expiresAt,
+          expiresAt: cached.expiresAt || null,
+          recheckAfter: cached.recheckAfter || null,
           rateLimited: false,
           rateLimitScope: null,
         };
@@ -2648,6 +2781,9 @@ export class ChatGPTBrowser {
     };
     if (probe.classification !== "unknown") {
       const checkedAt = Date.now();
+      const session = await browserSessionSnapshot();
+      const continuousPageSession =
+        session.browserRunning && session.chatgptPageOpen;
       const cachedProbe = {
         response: probe.response,
         classification: probe.classification,
@@ -2655,11 +2791,25 @@ export class ChatGPTBrowser {
         mode: mode || null,
         url: probe.url,
         checkedAt,
-        expiresAt: checkedAt + PRO_PROBE_CACHE_MS,
+        browserSessionId: continuousPageSession
+          ? session.browserSessionId
+          : null,
+        chatgptPageId: continuousPageSession ? session.chatgptPageId : null,
+        sessionInterruptedAt: continuousPageSession ? null : checkedAt,
+        recheckAfter: continuousPageSession
+          ? null
+          : checkedAt + PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+        expiresAt: continuousPageSession
+          ? null
+          : checkedAt + PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
       };
       await updateRuntimeState({ proProbe: cachedProbe });
       probe.checkedAt = cachedProbe.checkedAt;
       probe.expiresAt = cachedProbe.expiresAt;
+      probe.recheckAfter = cachedProbe.recheckAfter;
+      probe.cachePolicy = continuousPageSession
+        ? "same-page-session"
+        : "closed-page-grace";
     }
     return probe;
   }
@@ -2729,6 +2879,8 @@ export class ChatGPTBrowser {
         cached: probe.cached,
         checkedAt: probe.checkedAt,
         expiresAt: probe.expiresAt,
+        recheckAfter: probe.recheckAfter,
+        cachePolicy: probe.cachePolicy,
         rateLimited: probe.rateLimited,
         rateLimitScope: probe.rateLimitScope,
       },

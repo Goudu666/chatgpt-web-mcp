@@ -15,7 +15,7 @@ An unofficial local MCP server that lets Codex and other MCP clients operate `ch
 - Keep the dedicated browser and ChatGPT page open between MCP calls
 - Serialize browser control across MCP processes and apply conservative delays
 - Stop on rate-limit text or HTTP 429 without dismissing, retrying, or reloading
-- Route Pro requests through a configurable temporary identity probe
+- Route Pro requests through a configurable temporary identity probe and reuse a reliable result for the full lifetime of the same page session
 - Store only sanitized network error metadata
 
 ## Requirements
@@ -80,6 +80,8 @@ The bundled defaults preserve the original strict policy:
 - A GPT-5.5 mini match falls back to the default tier.
 - Any other answer stops the route.
 
+A reliable result does not expire while the same dedicated browser and ChatGPT page remain open. If either is closed, the result remains reusable for a three-hour grace period; the next Pro request after that period performs one new verification. Ending a normal MCP call only disconnects local control and does not start this timer. When the exact time of a manual close cannot be known, the grace period starts when the interrupted session is first detected.
+
 These values can be changed without editing source code:
 
 | Variable | Default |
@@ -91,6 +93,7 @@ These values can be changed without editing source code:
 | `CHATGPT_WEB_PROBE_FALLBACK_ID` | `gpt-5.5-mini` |
 | `CHATGPT_WEB_PROBE_ACCEPT_PATTERN` | GPT-5.6 Pro regular expression |
 | `CHATGPT_WEB_PROBE_FALLBACK_PATTERN` | GPT-5.5 mini regular expression |
+| `CHATGPT_WEB_PRO_RECHECK_AFTER_CLOSE_MS` | `10800000` (3 hours) |
 
 See [.env.example](.env.example). The project does not automatically load `.env`; inject variables through the MCP client, shell, or operating system.
 

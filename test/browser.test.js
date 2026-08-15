@@ -112,27 +112,118 @@ test("siteActionDelayMs enforces the configured start interval", () => {
   assert.equal(siteActionDelayMs(null, 16_000, 5_000), 0);
 });
 
-test("validProbeCache requires a fresh reliable result for the same mode", () => {
+test("validProbeCache stays valid for the same open browser page session", () => {
   const cache = {
     classification: "gpt-5.6-pro",
     policyKey: PROBE_POLICY_KEY,
     mode: "聊天",
-    expiresAt: 20_000,
+    checkedAt: 5_000,
+    expiresAt: 6_000,
+    browserSessionId: "browser-a",
+    chatgptPageId: "page-a",
   };
-  assert.equal(validProbeCache(cache, { mode: "聊天", now: 10_000 }), cache);
-  assert.equal(validProbeCache(cache, { mode: "工作", now: 10_000 }), null);
-  assert.equal(validProbeCache(cache, { mode: "聊天", now: 20_000 }), null);
+  const session = {
+    browserRunning: true,
+    browserStartedAt: 1_000,
+    browserSessionId: "browser-a",
+    chatgptPageOpen: true,
+    chatgptPageId: "page-a",
+  };
+  const cached = validProbeCache(cache, {
+    mode: "聊天",
+    session,
+    now: 1_000_000,
+  });
+  assert.equal(cached.classification, cache.classification);
+  assert.equal(cached.expiresAt, null);
+  assert.equal(validProbeCache(cache, { mode: "工作", session }), null);
   assert.equal(
-    validProbeCache({ ...cache, policyKey: "different-policy" }, { mode: "聊天", now: 10_000 }),
+    validProbeCache({ ...cache, policyKey: "different-policy" }, { mode: "聊天", session }),
     null,
   );
   assert.equal(
     validProbeCache(
       { ...cache, classification: "unknown" },
-      { mode: "聊天", now: 10_000 },
+      { mode: "聊天", session },
     ),
     null,
   );
+});
+
+test("validProbeCache waits three hours after a page or browser interruption", () => {
+  const cache = {
+    classification: "gpt-5.6-pro",
+    policyKey: PROBE_POLICY_KEY,
+    mode: "聊天",
+    checkedAt: 5_000,
+    browserSessionId: "browser-a",
+    chatgptPageId: "page-a",
+  };
+  const interrupted = validProbeCache(cache, {
+    mode: "聊天",
+    session: { browserRunning: false, chatgptPageOpen: false },
+    now: 10_000,
+    recheckAfterCloseMs: 30_000,
+  });
+  assert.equal(interrupted.sessionInterruptedAt, 10_000);
+  assert.equal(interrupted.recheckAfter, 40_000);
+  assert.equal(
+    validProbeCache(interrupted, {
+      mode: "聊天",
+      session: { browserRunning: false, chatgptPageOpen: false },
+      now: 39_999,
+      recheckAfterCloseMs: 30_000,
+    }),
+    interrupted,
+  );
+  assert.equal(
+    validProbeCache(interrupted, {
+      mode: "聊天",
+      session: { browserRunning: false, chatgptPageOpen: false },
+      now: 40_000,
+      recheckAfterCloseMs: 30_000,
+    }),
+    null,
+  );
+
+  const replacedPage = validProbeCache(cache, {
+    mode: "聊天",
+    session: {
+      browserRunning: true,
+      browserStartedAt: 1_000,
+      browserSessionId: "browser-a",
+      chatgptPageOpen: true,
+      chatgptPageId: "page-b",
+    },
+    now: 20_000,
+    recheckAfterCloseMs: 30_000,
+  });
+  assert.equal(replacedPage.sessionInterruptedAt, 20_000);
+  assert.equal(replacedPage.recheckAfter, 50_000);
+});
+
+test("validProbeCache migrates a legacy cache when its original browser is still open", () => {
+  const cache = {
+    classification: "gpt-5.6-pro",
+    policyKey: PROBE_POLICY_KEY,
+    mode: "聊天",
+    checkedAt: 5_000,
+    expiresAt: 6_000,
+  };
+  const migrated = validProbeCache(cache, {
+    mode: "聊天",
+    session: {
+      browserRunning: true,
+      browserStartedAt: 1_000,
+      browserSessionId: "browser-a",
+      chatgptPageOpen: true,
+      chatgptPageId: "page-a",
+    },
+    now: 1_000_000,
+  });
+  assert.equal(migrated.browserSessionId, "browser-a");
+  assert.equal(migrated.chatgptPageId, "page-a");
+  assert.equal(migrated.expiresAt, null);
 });
 
 test("redactDiagnosticPath removes conversation and opaque identifiers", () => {
