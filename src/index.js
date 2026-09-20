@@ -7,22 +7,30 @@ import { z } from "zod";
 import { ChatGPTBrowser } from "./browser.js";
 import {
   DEFAULT_ANSWER_TIER,
-  PROBE_ACCEPT_CLASSIFICATION,
-  PROBE_FALLBACK_CLASSIFICATION,
+  CONVERSATION_CHANGE_INTERVAL_MS,
+  CONTEXT_ARCHIVE_DIR,
+  MAX_CONVERSATION_TURNS,
+  PROBE_ENABLED,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
   PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+  POST_RESPONSE_CONVERSATION_COOLDOWN_MS,
+  REFRESH_BEFORE_NEW_CHAT,
   RESPONSE_TIMEOUT_MS,
+  SEND_INTERVAL_MS,
 } from "./config.js";
 import { userFacingError } from "./errors.js";
 
 const browser = new ChatGPTBrowser();
+const probeInstructions = PROBE_ENABLED
+  ? `实验性网络身份探针已显式启用：仅在用户要求身份核对时使用，非 mini 的 model_slug 不等于已经验证为 Pro。探针不会强制选择 Pro 档位。同一页面会话复用缓存，关闭后保留 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时；forceProbe 仅用于用户明确要求重新验证。`
+  : "临时 Pro 身份探针默认停用。不得调用 chatgpt_probe_pro_identity，也不得用 requestPro=true 调用 chatgpt_route_new_chat；这些调用会在新建临时对话或发送测试消息前停止。普通极高路由使用 requestPro=false。";
 const server = new McpServer({
   name: "chatgpt-web",
   version: "0.2.1",
 }, {
   instructions:
-    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。新任务优先用 chatgpt_route_new_chat：普通请求使用配置的默认档位“${DEFAULT_ANSWER_TIER}”；用户明确要求 Pro 时，临时使用“${PRO_ANSWER_TIER}”并发送身份探针，接受分类为“${PROBE_ACCEPT_CLASSIFICATION}”，回退分类为“${PROBE_FALLBACK_CLASSIFICATION}”。同一浏览器和 ChatGPT 页面会话内始终复用可靠探针；页面或浏览器关闭后保留结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
+    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。发送最小间隔 ${SEND_INTERVAL_MS / 1_000} 秒，对话变更最小间隔 ${CONVERSATION_CHANGE_INTERVAL_MS / 1_000} 秒，回答完成后再等 ${POST_RESPONSE_CONVERSATION_COOLDOWN_MS / 1_000} 秒才切换；这些是下限，不保证免于限流。新建前的额外刷新当前${REFRESH_BEFORE_NEW_CHAT ? "开启" : "关闭"}，由 CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT 控制。每次发送前仍刷新当前对话，并校验 URL、草稿和附件；检测到变化则停止。对话达到 ${MAX_CONVERSATION_TURNS} 轮或出现 maximum-length 错误时，原子发送会先读取完整 transcript 并归档到 ${CONTEXT_ARCHIVE_DIR}，再新建普通对话；直接 submit_prompt 则拦截。新任务优先用 chatgpt_route_new_chat，普通请求使用页面可用档位“${DEFAULT_ANSWER_TIER}”。${probeInstructions}`,
 });
 
 function asResult(value, isError = false) {
@@ -54,9 +62,9 @@ function tool(name, description, schema, handler, { allowDuringPause = false } =
   });
 }
 
-tool(
+  tool(
   "chatgpt_status",
-  "检查专用浏览器、登录、当前对话、模式与临时对话状态。仅在诊断或确需状态时调用；正常发送无需预先调用。默认不展开高级菜单。",
+  `检查专用浏览器、登录、当前对话、模式、临时对话和轮次状态（阈值 ${MAX_CONVERSATION_TURNS}）。仅在诊断或确需状态时调用；正常发送无需预先调用。默认不展开高级菜单。`,
   {
     includeSettings: z
       .boolean()
@@ -153,22 +161,22 @@ tool(
 
 tool(
   "chatgpt_select_answer_tier",
-  `选择输入框右侧的能力档位。当前支持精确选择配置的最高档“${PRO_ANSWER_TIER}”，并校验页面显示结果。`,
+  `选择输入框右侧当前可用的能力档位，并校验页面显示结果；不假设 Pro 档位存在。`,
   {
-    answerTier: z.string().min(1).describe(`能力档位名称；最高档默认为“${PRO_ANSWER_TIER}”。`),
+    answerTier: z.string().min(1).describe("页面当前可用的能力档位名称。"),
   },
   ({ answerTier }) => browser.selectAnswerTier(answerTier),
 );
 
 tool(
   "chatgpt_new_chat",
-  "创建新的普通或临时对话，并可同时选择模式、模型、思考强度和能力档位。",
+  "创建新的普通或临时对话，并可选择模式、模型、思考强度和能力档位。新建前额外刷新由 CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT 控制，默认关闭；刷新失败或有草稿/附件时停止。",
   {
     temporary: z.boolean().default(false).describe("true 表示临时对话，不进入历史记录。"),
     mode: z.string().min(1).optional().describe("可选模式，例如“聊天”或“工作”。"),
     model: z.string().min(1).optional().describe("可选模型名称。"),
     thinkingLevel: z.string().min(1).optional().describe("可选思考强度。"),
-    answerTier: z.string().min(1).optional().describe(`可选能力档位；传“${PRO_ANSWER_TIER}”时使用滑杆最后一档。`),
+    answerTier: z.string().min(1).optional().describe("可选能力档位；必须是页面当前可用值。"),
   },
   ({ temporary, mode, model, thinkingLevel, answerTier }) =>
     browser.newChat({ temporary, mode, model, thinkingLevel, answerTier }),
@@ -185,12 +193,19 @@ tool(
 
 tool(
   "chatgpt_write_prompt",
-  "把提示词准确写入 ChatGPT 网页输入框但不发送，适合先上传文件或让用户检查草稿。",
+  "把提示词准确写入 ChatGPT 网页输入框但不发送；为保护用户草稿，输入框非空时默认拒绝覆盖，需明确使用 append=true 追加。",
   {
     prompt: z.string().min(1),
-    append: z.boolean().default(false).describe("是否追加到已有草稿；默认覆盖。"),
+    append: z.boolean().default(false).describe("是否追加到已有草稿；默认保护并拒绝覆盖非空草稿。"),
   },
   ({ prompt, append }) => browser.writePrompt(prompt, { append }),
+);
+
+tool(
+  "chatgpt_enable_web_search",
+  "在当前输入框中启用 ChatGPT 网页原生“网页搜索”，并校验选中标记。应在写入提示词和上传文件后、发送前调用。",
+  {},
+  () => browser.enableWebSearch(),
 );
 
 tool(
@@ -204,7 +219,7 @@ tool(
 
 tool(
   "chatgpt_submit_prompt",
-  `发送当前输入框中的提示词，并可等待 ChatGPT 网页回答完成。当前能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待，timeoutMs 仅用于普通档位。`,
+  `发送当前输入框中的提示词，并可等待 ChatGPT 网页回答完成。发送前会强制刷新当前对话、校验轮次上限（${MAX_CONVERSATION_TURNS}）以及 URL、草稿和附件状态；达到上限时直接拦截，避免触发网页 maximum-length 错误。当前能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待，timeoutMs 仅用于普通档位。`,
   {
     wait: z.boolean().default(true),
     timeoutMs: z.number().int().min(5_000).max(900_000).default(RESPONSE_TIMEOUT_MS),
@@ -214,10 +229,11 @@ tool(
 
 tool(
   "chatgpt_send_message",
-  `组合工具：可新建或继续对话、选择模式/模型/思考强度/能力档位、切换临时对话、上传文件、写入提示词、发送并取得回答。能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待；普通档位仍使用 timeoutMs。只有用户明确要求上传时才传 files。`,
+  `组合工具：可新建或继续对话、选择模式/模型/思考强度/能力档位、切换临时对话、上传文件、写入提示词、发送并取得回答。继续已有对话时，发送前会强制刷新并检查 ${MAX_CONVERSATION_TURNS} 轮上限；达到上限或检测到网页 maximum-length 错误会先加载并归档完整 transcript（包括较早的懒加载历史）到 ${CONTEXT_ARCHIVE_DIR}，再自动新建普通对话，结果返回 conversationRotation/archivePath。刷新发生在上传和写入之前，避免旧页面状态覆盖用户消息。为保护用户草稿，若输入框已有不同内容会拒绝写入，不会覆盖；新建/切换对话前也会保护非空草稿。能力档位为“${PRO_ANSWER_TIER}”或模型名称带 Pro 时自动无限等待；普通档位仍使用 timeoutMs。只有用户明确要求上传时才传 files。`,
   {
     prompt: z.string().min(1),
     files: z.array(z.string().min(1)).default([]),
+    webSearch: z.boolean().default(false).describe("发送前启用并校验 ChatGPT 网页原生网页搜索。"),
     mode: z.string().min(1).optional(),
     model: z.string().min(1).optional(),
     thinkingLevel: z.string().min(1).optional(),
@@ -232,7 +248,9 @@ tool(
 
 tool(
   "chatgpt_probe_pro_identity",
-  `执行 Pro 身份探针：同一浏览器和 ChatGPT 页面会话内始终复用同模式的可靠结果；页面或浏览器关闭后继续复用 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。没有可用缓存时才新建临时对话、切到“${PRO_ANSWER_TIER}”、发送“${PROBE_PROMPT}”并无限等待。返回原回答及配置的接受/回退/unknown 分类，不创建正常对话。`,
+  PROBE_ENABLED
+    ? `执行已显式启用的实验性网络身份探针（兼容旧工具名）。临时对话使用当前档位发送“${PROBE_PROMPT}”；网络 model_slug 非 mini 不等于 Pro 身份证明。不自动选择 Pro，不创建正常对话。${probeInstructions}`
+    : "临时 Pro 身份探针当前停用；调用将明确停止，不打开临时对话，也不发送消息。",
   {
     mode: z.string().min(1).optional(),
     force: z.boolean().default(false).describe("true 表示忽略缓存并重新执行探针；仅在用户明确要求时使用。"),
@@ -242,11 +260,12 @@ tool(
 
 tool(
   "chatgpt_route_new_chat",
-  `按可配置策略新建并发送：普通请求使用“${DEFAULT_ANSWER_TIER}”；明确请求 Pro 时先执行临时身份探针，命中“${PROBE_ACCEPT_CLASSIFICATION}”才在正常对话继续使用“${PRO_ANSWER_TIER}”，命中“${PROBE_FALLBACK_CLASSIFICATION}”则回退默认档位，其他回答停止。浏览器始终常驻。`,
+  `普通请求新建非临时对话并使用页面可用档位“${DEFAULT_ANSWER_TIER}”。${probeInstructions} 浏览器始终常驻。`,
   {
     prompt: z.string().min(1).describe("最终正常对话要发送的实际提示词。"),
     files: z.array(z.string().min(1)).default([]),
-    requestPro: z.boolean().default(false).describe("用户是否明确要求 Pro。"),
+    webSearch: z.boolean().default(false).describe("发送前启用并校验 ChatGPT 网页原生网页搜索。"),
+    requestPro: z.boolean().default(false).describe("兼容旧参数：true 请求实验性身份探针，并不保证选择 Pro；探针默认停用，此时 true 会在新建临时对话或发送探针前拒绝。"),
     forceProbe: z.boolean().default(false).describe("是否忽略会话级 Pro 探针缓存；仅在用户明确要求时设为 true。"),
     mode: z.string().min(1).optional(),
     wait: z.boolean().default(true),
@@ -296,6 +315,16 @@ tool(
       .describe("是否额外读取模型和思考强度；默认 false。"),
   },
   ({ includeSettings }) => browser.getLatestResponse({ includeSettings }),
+  { allowDuringPause: true },
+);
+
+tool(
+  "chatgpt_archive_conversation",
+  `将当前对话完整 transcript（包含滚动加载的较早历史）以 Markdown 原子写入 ${CONTEXT_ARCHIVE_DIR}，用于跨会话持久化上下文；不会发送消息或切换对话。`,
+  {
+    reason: z.string().min(1).default("manual-archive"),
+  },
+  ({ reason }) => browser.archiveConversation({ reason }),
   { allowDuringPause: true },
 );
 

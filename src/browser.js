@@ -11,25 +11,31 @@ import {
   CHATGPT_URL,
   CHROME_EXECUTABLE,
   CONVERSATION_CHANGE_INTERVAL_MS,
+  CONTEXT_ARCHIVE_DIR,
   DEFAULT_ANSWER_TIER,
   HEADLESS,
   HISTORY_QUIET_PERIOD_MS,
   MAX_HISTORY_RESULTS,
+  MAX_CONVERSATION_TURNS,
   BROWSER_STATE_FILE,
   NETWORK_LOG_FILE,
   OPERATION_LOCK_FILE,
   PAGE_INTERACTION_INTERVAL_MS,
+  PAGE_STARTUP_DELAY_MS,
   POST_BREAKER_COOLDOWN_MS,
   POST_RESPONSE_CONVERSATION_COOLDOWN_MS,
   PROBE_ACCEPT_CLASSIFICATION,
   PROBE_ACCEPT_PATTERN,
+  PROBE_ENABLED,
   PROBE_FALLBACK_CLASSIFICATION,
   PROBE_FALLBACK_PATTERN,
+  PROBE_NETWORK_ACCEPT_CLASSIFICATION,
   PROBE_POLICY_KEY,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
   PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
   RECONNECT_DELAY_MS,
+  REFRESH_BEFORE_NEW_CHAT,
   RESPONSE_TIMEOUT_MS,
   RUNTIME_LOCK_FILE,
   RUNTIME_STATE_FILE,
@@ -40,11 +46,38 @@ import {
 import { ChatGPTWebError } from "./errors.js";
 import { SELECTORS, TEXT } from "./selectors.js";
 
+// `:has-text()` is a Playwright-only selector and cannot be passed to
+// document.querySelectorAll() inside page.evaluate(). Filter stale thinking
+// wrappers in JavaScript instead, using an anchored match so a real answer
+// mentioning the word "thinking" is not discarded.
+const THINKING_WRAPPER_RE = /^\s*(?:thinking|思考)(?:\s*(?:[.…:：]|$))/iu;
+
 function normalize(value) {
   return String(value || "")
     .replace(/\s+/g, " ")
     .trim()
     .toLocaleLowerCase();
+}
+
+/**
+ * Decide whether an automation request may write to the composer.
+ *
+ * A non-empty composer is user-owned state.  It must never be replaced by a
+ * tool retry or by a follow-up sent to the currently selected conversation.
+ */
+export function promptWriteAction(existingText, requestedText, { append = false } = {}) {
+  const existing = String(existingText || "");
+  const requested = String(requestedText || "");
+  if (append) return "append";
+  if (!normalize(existing)) return "replace-empty";
+  if (normalize(existing) === normalize(requested)) return "already-present";
+  return "reject-nonempty";
+}
+
+export function composerEditReason({ insideUserMessage = false, visibleCancel = false } = {}) {
+  if (insideUserMessage) return "composer-inside-user-message";
+  if (visibleCancel) return "visible-edit-cancel-control";
+  return null;
 }
 
 export function isProModel(value) {
@@ -61,6 +94,33 @@ export function isProTier(value) {
 export function parseAnswerTier(valueText) {
   const text = String(valueText || "").replace(/\s+/g, " ").trim();
   return text ? text.split(/[,，]/, 1)[0]?.trim() || null : null;
+}
+
+export function normalizeModelSlug(value) {
+  return String(value || "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[_\s.]+/g, "-")
+    .replace(/-+/g, "-");
+}
+
+export function classifyNetworkModelSlug(
+  modelSlug,
+  {
+    fallbackClassification = PROBE_FALLBACK_CLASSIFICATION,
+    acceptClassification = PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+  } = {},
+) {
+  const normalized = normalizeModelSlug(modelSlug);
+  if (!normalized) return null;
+  if (/^gpt-5-5-mini(?:-|$)/u.test(normalized)) return fallbackClassification;
+  return acceptClassification;
+}
+
+export function interruptedGenerationFields(runtime, interruptedAt = Date.now()) {
+  return runtime?.activeGeneration?.active
+    ? { activeGeneration: null, lastGenerationInterruptedAt: interruptedAt }
+    : { activeGeneration: null };
 }
 
 function matchesConfiguredPattern(text, pattern) {
@@ -81,8 +141,19 @@ export function classifyProbeModel(
     fallbackPattern = PROBE_FALLBACK_PATTERN,
     acceptClassification = PROBE_ACCEPT_CLASSIFICATION,
     fallbackClassification = PROBE_FALLBACK_CLASSIFICATION,
+    networkAcceptClassification = PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+    networkModelSlug = null,
+    requireNetworkModelSlug = false,
   } = {},
 ) {
+  if (networkModelSlug != null) {
+    const networkClassification = classifyNetworkModelSlug(networkModelSlug, {
+      acceptClassification: networkAcceptClassification,
+      fallbackClassification,
+    });
+    if (networkClassification) return networkClassification;
+  }
+  if (requireNetworkModelSlug) return "unknown";
   const text = String(response || "");
   if (matchesConfiguredPattern(text, acceptPattern)) return acceptClassification;
   if (matchesConfiguredPattern(text, fallbackPattern)) return fallbackClassification;
@@ -109,6 +180,43 @@ export function classifyRateLimitText(text) {
   return { limited: true, scope: "unknown" };
 }
 
+/**
+ * Detect the page-level conversation length failure before another prompt is
+ * submitted.  ChatGPT has shipped both English and Chinese variants of this
+ * banner; matching the stable meaning keeps the guard independent of wording.
+ */
+export function classifyConversationLengthText(text) {
+  const body = normalize(text);
+  const limited =
+    /you(?:'|’)ve reached the maximum length for this conversation/.test(body) ||
+    /maximum length .*conversation.*start(?:ing)? a new chat/.test(body) ||
+    /对话(?:已)?达到(?:最大)?长度(?:上限)?|对话长度上限|此对话的长度上限/.test(body) ||
+    /conversation (?:is )?(?:too long|at maximum length)/.test(body);
+  return {
+    limited,
+    scope: limited ? "conversation-length" : null,
+  };
+}
+
+export function conversationTurnLimitState(
+  { userMessageCount = 0, assistantMessageCount = 0, lengthLimitDetected = false } = {},
+  limit = MAX_CONVERSATION_TURNS,
+) {
+  const users = Math.max(0, Number(userMessageCount) || 0);
+  const assistants = Math.max(0, Number(assistantMessageCount) || 0);
+  const turns = Math.max(users, assistants);
+  const threshold = Math.max(1, Number(limit) || MAX_CONVERSATION_TURNS);
+  return {
+    userMessageCount: users,
+    assistantMessageCount: assistants,
+    turnCount: turns,
+    limit: threshold,
+    limitReached: turns >= threshold,
+    lengthLimitDetected: Boolean(lengthLimitDetected),
+    shouldRotate: Boolean(lengthLimitDetected || turns >= threshold),
+  };
+}
+
 export function siteActionDelayMs(
   lastActionAt,
   now = Date.now(),
@@ -126,6 +234,7 @@ export function networkRateLimitScope(pathname) {
 }
 
 const CONVERSATION_CHANGE_ACTIONS = new Set([
+  "refresh-before-new-chat",
   "new-chat",
   "enable-temporary-chat",
   "disable-temporary-chat",
@@ -133,6 +242,8 @@ const CONVERSATION_CHANGE_ACTIONS = new Set([
 ]);
 
 const HISTORY_QUIET_ACTIONS = new Set([
+  "refresh-before-new-chat",
+  "read-history-api",
   "new-chat",
   "disable-temporary-chat",
   "open-history-sidebar",
@@ -215,8 +326,18 @@ export function validProbeCache(
 ) {
   if (!value) return null;
   if (value.policyKey !== PROBE_POLICY_KEY) return null;
+  if (value.modelSlugSource !== "conversation-response" || !value.modelSlug) {
+    return null;
+  }
+  if (classifyNetworkModelSlug(value.modelSlug) !== value.classification) {
+    return null;
+  }
   if (
-    ![PROBE_ACCEPT_CLASSIFICATION, PROBE_FALLBACK_CLASSIFICATION].includes(
+    ![
+      PROBE_ACCEPT_CLASSIFICATION,
+      PROBE_FALLBACK_CLASSIFICATION,
+      PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+    ].includes(
       value.classification,
     )
   ) {
@@ -355,6 +476,61 @@ function uniqueBy(items, key) {
 function conversationIdFromUrl(value) {
   const match = String(value || "").match(/\/c\/([a-zA-Z0-9-]+)/);
   return match?.[1] || null;
+}
+
+/**
+ * Parse the complete transcript returned by ChatGPT's conversation endpoint.
+ * The page virtualizes old turns, so the API mapping is the authoritative
+ * source for turn counting and archival whenever it is available.
+ */
+export function parseConversationApiTranscript(payload) {
+  const parseMessage = (message, fallbackId = null) => {
+    const author = message?.author?.role;
+    if (author !== "user" && author !== "assistant") return null;
+    const parts = Array.isArray(message?.content?.parts) ? message.content.parts : [];
+    const text = parts
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part.text === "string") return part.text;
+        return "";
+      })
+      .join("");
+    if (!text.trim()) return null;
+    return { author, id: message?.id || fallbackId, text };
+  };
+  if (Array.isArray(payload?.messages)) {
+    return payload.messages.map((message) => parseMessage(message)).filter(Boolean);
+  }
+  const mapping = payload?.mapping;
+  if (!mapping || typeof mapping !== "object") return [];
+  const nodes = Array.isArray(mapping)
+    ? mapping.map((message, index) => ({ id: message?.id || `index-${index}`, message }))
+    : Object.entries(mapping).map(([id, node]) => ({ id, message: node?.message || node }));
+  const byId = new Map(nodes.map((node) => [node.id, node.message]));
+  const orderedMessages = [];
+  const seen = new Set();
+  let nodeId = payload?.current_node || null;
+  while (nodeId && !seen.has(nodeId)) {
+    seen.add(nodeId);
+    const message = byId.get(nodeId);
+    if (!message) break;
+    orderedMessages.unshift({ id: nodeId, message });
+    nodeId = mapping?.[nodeId]?.parent || null;
+  }
+  if (!orderedMessages.length) {
+    const fallback = nodes
+      .map((node, index) => ({ ...node, index }))
+      .sort((a, b) => {
+        const aTime = Number(a.message?.create_time);
+        const bTime = Number(b.message?.create_time);
+        if (Number.isFinite(aTime) && Number.isFinite(bTime) && aTime !== bTime) {
+          return aTime - bTime;
+        }
+        return a.index - b.index;
+      });
+    orderedMessages.push(...fallback);
+  }
+  return orderedMessages.map(({ id, message }) => parseMessage(message, id)).filter(Boolean);
 }
 
 function absoluteChatUrl(href) {
@@ -514,12 +690,15 @@ async function withRuntimeState(update, { signal } = {}) {
 }
 
 async function waitForSiteAction(action, signal) {
-  const initial = await readRuntimeState();
+  let initial = await readRuntimeState();
   if (initial.circuitBreaker?.active) {
     throw new ChatGPTWebError(
       "ChatGPT 安全熔断已开启。不会执行新的网页操作；请先人工确认限流提示已经消失。",
       { circuitBreaker: initial.circuitBreaker, action },
     );
+  }
+  if (generationIsStale(initial)) {
+    initial = await clearStaleActiveGeneration(initial);
   }
   if (initial.activeGeneration?.active) {
     throw new ChatGPTWebError(
@@ -548,6 +727,13 @@ async function waitForSiteAction(action, signal) {
         "等待期间 ChatGPT 安全熔断已开启，当前网页操作已取消。",
         { circuitBreaker: state.circuitBreaker, action },
       );
+    }
+    if (generationIsStale(state)) {
+      state = {
+        ...state,
+        activeGeneration: null,
+        lastGenerationInterruptedAt: Date.now(),
+      };
     }
     if (state.activeGeneration?.active) {
       throw new ChatGPTWebError(
@@ -665,6 +851,31 @@ function processIsAlive(pid) {
   }
 }
 
+export function generationIsStale(runtime) {
+  const generation = runtime?.activeGeneration;
+  const ownerPid = Number(generation?.ownerPid || 0);
+  return Boolean(
+    generation?.active &&
+      ownerPid > 0 &&
+      ownerPid !== process.pid &&
+      !processIsAlive(ownerPid),
+  );
+}
+
+async function clearStaleActiveGeneration(runtime) {
+  if (!generationIsStale(runtime)) return runtime;
+  const interruptedAt = Date.now();
+  await updateRuntimeState({
+    activeGeneration: null,
+    lastGenerationInterruptedAt: interruptedAt,
+  });
+  return {
+    ...runtime,
+    activeGeneration: null,
+    lastGenerationInterruptedAt: interruptedAt,
+  };
+}
+
 async function acquireOperationLock(operation, signal) {
   await fs.mkdir(path.dirname(OPERATION_LOCK_FILE), { recursive: true });
   const deadline = Date.now() + ACTION_TIMEOUT_MS;
@@ -745,6 +956,44 @@ export class ChatGPTBrowser {
   #answerTier = null;
   #requestSignal = null;
   #networkLoggingPages = new WeakSet();
+  #apiHeaders = {};
+
+  async captureConversationModelSlug(operation) {
+    const page = await this.page();
+    const modelSlugs = [];
+    const bodyReads = [];
+    const onResponse = (response) => {
+      let pathname;
+      try {
+        pathname = new URL(response.url()).pathname;
+      } catch {
+        return;
+      }
+      if (!/^\/backend-api\/(?:f\/)?conversation(?:\/|$)/iu.test(pathname)) return;
+      const read = response
+        .body()
+        .then((body) => {
+          const text = body.toString("utf8");
+          for (const match of text.matchAll(/"model_slug"\s*:\s*"([^"]+)"/gu)) {
+            if (match[1]) modelSlugs.push(match[1]);
+          }
+        })
+        .catch(() => {});
+      bodyReads.push(read);
+    };
+    page.on("response", onResponse);
+    try {
+      const result = await operation();
+      await Promise.allSettled(bodyReads);
+      return {
+        result,
+        modelSlug: modelSlugs.at(-1) || null,
+        modelSlugs: [...new Set(modelSlugs)],
+      };
+    } finally {
+      page.off("response", onResponse);
+    }
+  }
 
   async close({ terminateBrowser = false } = {}) {
     const chromeProcess = this.#chromeProcess;
@@ -846,12 +1095,16 @@ export class ChatGPTBrowser {
   }
 
   async assertActionsAllowed(action = "tool-call") {
-    const state = await readRuntimeState();
+    let state = await readRuntimeState();
     if (state.circuitBreaker?.active) {
       throw new ChatGPTWebError(
         "ChatGPT 安全熔断已开启。不会执行新的网页操作；请先人工确认限流提示已经消失。",
         { circuitBreaker: state.circuitBreaker, action },
       );
+    }
+    if (generationIsStale(state)) {
+      state = await clearStaleActiveGeneration(state);
+      return { allowed: true, staleGenerationCleared: true };
     }
     if (state.activeGeneration?.active) {
       throw new ChatGPTWebError(
@@ -965,6 +1218,25 @@ export class ChatGPTBrowser {
   attachNetworkDiagnostics(page) {
     if (this.#networkLoggingPages.has(page)) return;
     this.#networkLoggingPages.add(page);
+    page.on("request", (request) => {
+      let pathname;
+      try {
+        pathname = new URL(request.url()).pathname;
+      } catch {
+        return;
+      }
+      if (!/^\/backend-api\//iu.test(pathname)) return;
+      const headers = request.headers();
+      if (!headers.authorization) return;
+      // Reuse the browser's complete request fingerprint.  ChatGPT's edge
+      // rejects a hand-built Node request even when the bearer token is valid.
+      // Cookie and body headers are supplied separately by the API reader.
+      this.#apiHeaders = Object.fromEntries(
+        Object.entries(headers).filter(
+          ([name]) => !["cookie", "content-length", "host"].includes(name),
+        ),
+      );
+    });
     page.on("response", (response) => {
       const status = response.status();
       if (status !== 403 && status !== 429 && status < 500) return;
@@ -986,6 +1258,9 @@ export class ChatGPTBrowser {
       this.appendNetworkDiagnostic(entry).catch(() => {});
       if (status === 429) {
         const scope = networkRateLimitScope(diagnosticPath);
+        // History failures are diagnostic-only; page-visible rate-limit
+        // warnings still stop operations through the existing text checks.
+        if (scope === "history") return;
         this.tripCircuitBreaker(scope, `network-response:${diagnosticPath}`).catch(() => {});
         page
           .evaluate(
@@ -1016,6 +1291,7 @@ export class ChatGPTBrowser {
       );
     }
 
+    let openedChatGPTPage = false;
     try {
       const prior = await readBrowserState();
       const priorEndpoint = await chromeEndpoint(Number(prior?.port));
@@ -1053,6 +1329,7 @@ export class ChatGPTBrowser {
           stdio: ["ignore", "ignore", "ignore"],
         });
         this.#chromeProcess.unref();
+        openedChatGPTPage = true;
 
         const endpoint = await waitForChromeEndpoint(port, this.#chromeProcess, stderrLines);
         this.#browser = await chromium.connectOverCDP(endpoint);
@@ -1109,6 +1386,12 @@ export class ChatGPTBrowser {
         { waitUntil: "domcontentloaded" },
         this.signal(),
       );
+      openedChatGPTPage = true;
+    }
+
+    if (openedChatGPTPage && PAGE_STARTUP_DELAY_MS > 0) {
+      await this.#page.waitForLoadState("domcontentloaded", { timeout: ACTION_TIMEOUT_MS });
+      await waitWithAbort(PAGE_STARTUP_DELAY_MS, this.signal());
     }
 
     return this.#page;
@@ -1122,6 +1405,9 @@ export class ChatGPTBrowser {
       persistent: true,
       browserRunning,
       reconnectDelayMs: RECONNECT_DELAY_MS,
+      pageStartupDelayMs: PAGE_STARTUP_DELAY_MS,
+      proProbeEnabled: PROBE_ENABLED,
+      refreshBeforeNewChat: REFRESH_BEFORE_NEW_CHAT,
       siteActionIntervalMs: SITE_ACTION_INTERVAL_MS,
       pageInteractionIntervalMs: PAGE_INTERACTION_INTERVAL_MS,
       sendIntervalMs: SEND_INTERVAL_MS,
@@ -1153,7 +1439,11 @@ export class ChatGPTBrowser {
     const closedAt = Date.now();
     const reliableProbe =
       runtime.proProbe?.policyKey === PROBE_POLICY_KEY &&
-      [PROBE_ACCEPT_CLASSIFICATION, PROBE_FALLBACK_CLASSIFICATION].includes(
+      [
+        PROBE_ACCEPT_CLASSIFICATION,
+        PROBE_FALLBACK_CLASSIFICATION,
+        PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+      ].includes(
         runtime.proProbe?.classification,
       )
         ? {
@@ -1164,7 +1454,11 @@ export class ChatGPTBrowser {
           }
         : null;
     await this.close({ terminateBrowser: true });
-    await updateRuntimeState({ authenticatedUntil: 0, proProbe: reliableProbe });
+    await updateRuntimeState({
+      authenticatedUntil: 0,
+      proProbe: reliableProbe,
+      ...interruptedGenerationFields(runtime, closedAt),
+    });
     return {
       closed: true,
       pid: state?.pid || null,
@@ -1221,6 +1515,236 @@ export class ChatGPTBrowser {
       await page.waitForTimeout(250);
     }
     return null;
+  }
+
+  async composerText(composer = null) {
+    const target = composer || (await this.composer());
+    if (!target) return "";
+    return target.evaluate((element) => {
+      if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+        return element.value;
+      }
+      // ProseMirror keeps capability pills (for example the selected Web
+      // search pill) inside the contenteditable.  They are UI state, not
+      // user-authored prompt text, and must not trip the draft guard.
+      const clone = element.cloneNode(true);
+      clone
+        .querySelectorAll(
+          "[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]",
+        )
+        .forEach((node) => node.remove());
+      return clone.innerText || clone.textContent || "";
+    });
+  }
+
+  /**
+   * Archived conversations render their transcript without a composer.  The
+   * selected project conversation can still be continued, but only after the
+   * page's explicit Unarchive action restores the composer.  Do this lazily
+   * on write paths; read-only history/status calls must not mutate archive
+   * state.
+   */
+  async unarchiveConversationIfNeeded() {
+    const page = await this.page();
+    const button = await this.firstVisible(SELECTORS.unarchiveButtons, {
+      timeout: 500,
+    });
+    if (!button) return { unarchived: false };
+
+    await this.domClick(button, "unarchive-conversation");
+    await page.waitForTimeout(1_000);
+    const remaining = await this.firstVisible(SELECTORS.unarchiveButtons, {
+      timeout: 500,
+    });
+    // The clicked menu item can remain mounted briefly during the archive
+    // mutation.  The composer is the durable write-path signal; only fail if
+    // both the button and the missing composer persist after the transition.
+    const composer = remaining ? await this.composer() : null;
+    if (remaining && !composer) {
+      throw new ChatGPTWebError("取消归档后页面仍显示归档状态，已停止发送。", {
+        url: page.url(),
+        unarchiveVerified: false,
+      });
+    }
+    return { unarchived: true, unarchiveVerified: !remaining || Boolean(composer) };
+  }
+
+  /**
+   * Reload the currently selected ChatGPT conversation immediately before a
+   * tool-managed send.  The browser page is persistent across MCP calls, so a
+   * stale React tree can otherwise keep an old user turn selected and a new
+   * prompt may replace that turn instead of appending a message.
+   *
+   * The caller must invoke this before uploading files or changing the
+   * composer.  A direct submit of an existing draft is also supported: the
+   * draft is captured, the page is reloaded, and the exact text is restored
+   * only when the refreshed composer is empty.  Any unexpected change is a
+   * hard error rather than an overwrite.
+   */
+  async refreshBeforeSend({ reason = "send" } = {}) {
+    const page = await this.page();
+    await this.ensureSignedIn();
+    const unarchiveResult = await this.unarchiveConversationIfNeeded();
+    const beforeUrl = page.url();
+    const beforeParsed = new URL(beforeUrl);
+    const beforeConversationId = conversationIdFromUrl(beforeUrl);
+    const beforeTemporary = beforeParsed.searchParams.get("temporary-chat") === "true";
+    const beforeComposer = await this.composer();
+    if (!beforeComposer) throw new ChatGPTWebError("刷新发送页面前没有找到提示词输入框。", { url: beforeUrl });
+    await this.assertComposerWritable(`refresh-before-${reason}`, beforeComposer);
+    const beforeDraft = await this.composerText(beforeComposer);
+    const beforeSearch = await this.webSearchState();
+    const pendingFiles = await page
+      .locator(SELECTORS.fileInput.join(", "))
+      .evaluateAll((inputs) =>
+        inputs.reduce((count, input) => count + Number(input.files?.length || 0), 0),
+      )
+      .catch(() => 0);
+
+    // File inputs are cleared by a full page reload.  Refuse to risk silently
+    // dropping an attachment; the atomic chatgpt_send_message path refreshes
+    // before upload and remains safe.
+    if (pendingFiles > 0) {
+      throw new ChatGPTWebError(
+        "发送前检测到尚未发送的附件；为避免刷新丢失附件，请使用 chatgpt_send_message 原子操作重试。",
+        { pendingFiles, url: beforeUrl, refreshRequired: true },
+      );
+    }
+
+    await this.pageInteraction("refresh-before-send");
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(500);
+    // Do not trust the pre-reload auth cache for the refreshed document.
+    this.#signedInUntil = 0;
+    await this.ensureSignedIn();
+
+    const afterUrl = page.url();
+    const afterParsed = new URL(afterUrl);
+    const afterConversationId = conversationIdFromUrl(afterUrl);
+    const afterTemporary = afterParsed.searchParams.get("temporary-chat") === "true";
+    if (
+      afterParsed.pathname !== beforeParsed.pathname ||
+      afterConversationId !== beforeConversationId ||
+      afterTemporary !== beforeTemporary
+    ) {
+      throw new ChatGPTWebError(
+        "发送前刷新改变了当前对话，已停止以避免把消息写入错误会话。",
+        {
+          beforeUrl,
+          afterUrl,
+          beforeConversationId,
+          afterConversationId,
+          beforeTemporary,
+          afterTemporary,
+          refreshRequired: true,
+        },
+      );
+    }
+
+    const afterComposer = await this.composer();
+    if (!afterComposer) {
+      throw new ChatGPTWebError("发送前刷新完成，但输入框未恢复。", {
+        url: afterUrl,
+        refreshRequired: true,
+      });
+    }
+    await this.assertComposerWritable(`refresh-after-${reason}`, afterComposer);
+    const afterDraft = await this.composerText(afterComposer);
+    if (normalize(beforeDraft) !== normalize(afterDraft)) {
+      if (!normalize(afterDraft) && normalize(beforeDraft)) {
+        await this.fill(afterComposer, beforeDraft, "restore-draft-after-refresh");
+      } else {
+        throw new ChatGPTWebError(
+          "发送前刷新后输入框内容发生变化，已拒绝继续以保护用户草稿。",
+          {
+            beforeCharacters: beforeDraft.length,
+            afterCharacters: afterDraft.length,
+            beforePreview: beforeDraft.slice(0, 160),
+            afterPreview: afterDraft.slice(0, 160),
+            overwritePrevented: true,
+            refreshRequired: true,
+          },
+        );
+      }
+    }
+
+    if (beforeSearch.selected && !(await this.webSearchState()).selected) {
+      await this.enableWebSearch();
+    }
+    return {
+      refreshed: true,
+      ...unarchiveResult,
+      beforeUrl,
+      afterUrl,
+      conversationId: afterConversationId,
+      draftRestored: Boolean(normalize(beforeDraft) && !normalize(afterDraft)),
+      webSearchRestored: Boolean(beforeSearch.selected),
+    };
+  }
+
+  async composerEditState(composer = null) {
+    const target = composer || (await this.composer());
+    if (!target) return { editing: false, reason: null };
+    const signals = await target.evaluate((element) => {
+      const userMessage = element.closest(
+        "[data-message-author-role='user'], article[data-turn='user'], section[data-turn='user']",
+      );
+      if (userMessage) {
+        return { insideUserMessage: true, visibleCancel: false };
+      }
+
+      // ChatGPT keeps the composer in the page root during ordinary sends,
+      // but moves it into the selected user turn when the pencil action is
+      // active.  The cancel control is a second signal for layouts that do
+      // not preserve the user-turn ancestor.
+      const scope = element.closest("form") || element.parentElement;
+      const visible = (node) => {
+        if (!(node instanceof HTMLElement)) return false;
+        const style = getComputedStyle(node);
+        const rect = node.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      };
+      const cancel = [...(scope?.querySelectorAll("button") || [])].find((button) => {
+        if (!visible(button)) return false;
+        const label = `${button.getAttribute("aria-label") || ""} ${button.innerText || ""}`;
+        return /cancel\s+edit|取消编辑|cancel|取消/i.test(label) &&
+          !/stop|停止|close|关闭/i.test(label);
+      });
+      return { insideUserMessage: false, visibleCancel: Boolean(cancel) };
+    });
+    const reason = composerEditReason(signals);
+    return { editing: Boolean(reason), reason };
+  }
+
+  async assertComposerWritable(action, composer = null) {
+    const state = await this.composerEditState(composer);
+    if (!state.editing) return state;
+    throw new ChatGPTWebError(
+      "当前输入框处于用户消息编辑态，已拒绝写入或发送，避免覆盖原用户消息。",
+      {
+        action,
+        editState: state,
+        nextStep: "请先由用户取消编辑或完成人工编辑，再重试网页操作。",
+        overwritePrevented: true,
+      },
+    );
+  }
+
+  async assertComposerEmpty(action) {
+    const composer = await this.composer();
+    if (!composer) return;
+    await this.assertComposerWritable(action, composer);
+    const existing = await this.composerText(composer);
+    if (!normalize(existing)) return;
+    throw new ChatGPTWebError(
+      "输入框已有用户草稿，已拒绝切换或新建对话以避免覆盖。",
+      {
+        action,
+        existingCharacters: existing.length,
+        existingPreview: existing.slice(0, 160),
+        nextStep: "请先由用户手动处理当前草稿，再重试网页操作。",
+      },
+    );
   }
 
   async signedIn() {
@@ -1332,6 +1856,7 @@ export class ChatGPTBrowser {
     const signedIn = await this.signedIn();
     const settings =
       signedIn && includeSettings ? await this.advancedSettings() : this.cachedSettings();
+    const conversation = signedIn ? await this.conversationTurnStats() : null;
     return {
       browserRunning: true,
       signedIn,
@@ -1342,6 +1867,16 @@ export class ChatGPTBrowser {
       mode: signedIn ? await this.currentMode() : null,
       thinkingLevel: signedIn ? settings.thinkingLevel : null,
       temporary: signedIn ? await this.temporaryState() : null,
+      conversationTurns: conversation?.turnCount ?? null,
+      userMessageCount: conversation?.userMessageCount ?? null,
+      assistantMessageCount: conversation?.assistantMessageCount ?? null,
+      maxConversationTurns: MAX_CONVERSATION_TURNS,
+      conversationRotationRequired: conversation?.shouldRotate ?? false,
+      conversationLengthLimitDetected: conversation?.lengthLimitDetected ?? false,
+      transcriptMessageCount: conversation?.transcriptMessageCount ?? null,
+      transcriptLoaded: conversation?.transcriptLoaded ?? false,
+      transcriptLoadPasses: conversation?.transcriptLoadPasses ?? 0,
+      transcriptSource: conversation?.transcriptSource ?? null,
       profile: USER_DATA_DIR,
     };
   }
@@ -1364,6 +1899,7 @@ export class ChatGPTBrowser {
       if (!blank) {
         const newChat = await this.firstVisible(SELECTORS.newChatLinks, { timeout: 1_500 });
         if (newChat) {
+          await this.assertComposerEmpty("new-chat");
           await this.siteAction("new-chat");
           // ChatGPT can animate two overlapping sidebar layers. A regular
           // Playwright click then waits on an inner SVG that intercepts the
@@ -1374,7 +1910,11 @@ export class ChatGPTBrowser {
               ({ userSelectors, assistantSelectors }) =>
                 location.pathname === "/" &&
                 document.querySelectorAll(userSelectors).length === 0 &&
-                document.querySelectorAll(assistantSelectors).length === 0,
+                [...document.querySelectorAll(assistantSelectors)].filter(
+                  (element) => !/^\s*(?:thinking|思考)(?:\s*(?:[.…:：]|$))/iu.test(
+                    element.innerText || element.textContent || "",
+                  ),
+                ).length === 0,
               {
                 userSelectors: SELECTORS.userMessages.join(", "),
                 assistantSelectors: SELECTORS.assistantMessages.join(", "),
@@ -1433,19 +1973,47 @@ export class ChatGPTBrowser {
     };
   }
 
+  async refreshBeforeNewChat() {
+    const page = await this.page();
+    await this.ensureSignedIn();
+    await this.assertComposerEmpty("refresh-before-new-chat");
+    const pendingFiles = await page
+      .locator(SELECTORS.fileInput.join(", "))
+      .evaluateAll((inputs) =>
+        inputs.reduce((count, input) => count + Number(input.files?.length || 0), 0),
+      );
+    if (pendingFiles > 0) {
+      throw new ChatGPTWebError("当前有未发送的附件，已拒绝刷新并新建对话。", { pendingFiles });
+    }
+    await this.siteAction("refresh-before-new-chat");
+    await this.pageInteraction("refresh-before-new-chat-reload");
+    const beforeUrl = page.url();
+    const startedAt = Date.now();
+    await page.reload({ waitUntil: "domcontentloaded" });
+    this.#signedInUntil = 0;
+    await this.ensureSignedIn();
+    await this.throwIfRateLimited();
+    return { refreshed: true, beforeUrl, afterUrl: page.url(), startedAt, completedAt: Date.now() };
+  }
+
   async newChat(
     { temporary = false, model, mode, thinkingLevel, answerTier } = {},
-    { includeStatus = true } = {},
+    { includeStatus = true, refreshBeforeNewChat = REFRESH_BEFORE_NEW_CHAT } = {},
   ) {
+    const refreshResult = refreshBeforeNewChat ? await this.refreshBeforeNewChat() : null;
     const root = await this.openRoot({ temporary });
     if (mode) await this.selectMode(mode);
     if (model) await this.selectModel(model);
     if (thinkingLevel) await this.selectThinkingLevel(thinkingLevel);
     if (answerTier) await this.selectAnswerTier(answerTier);
     if (temporary && !root.temporary) await this.setTemporary(true, { includeStatus: false });
-    if (includeStatus) return this.status();
+    if (includeStatus) {
+      const status = await this.status();
+      return refreshResult ? { ...status, newChatRefresh: refreshResult } : status;
+    }
     return {
       ...root,
+      ...(refreshResult ? { newChatRefresh: refreshResult } : {}),
       configured: {
         mode: mode || null,
         model: model || null,
@@ -1498,6 +2066,7 @@ export class ChatGPTBrowser {
 
     const button = await this.firstVisible(SELECTORS.temporaryChatButtons, { timeout: 1_500 });
     if (button) {
+      await this.assertComposerEmpty(enabled ? "enable-temporary-chat" : "disable-temporary-chat");
       await this.siteAction(enabled ? "enable-temporary-chat" : "disable-temporary-chat");
       await this.click(button, enabled ? "enable-temporary-chat-click" : "disable-temporary-chat-click");
       await page.waitForTimeout(500);
@@ -1987,6 +2556,61 @@ export class ChatGPTBrowser {
     await page.waitForTimeout(250);
   }
 
+  async directAdvancedSettings() {
+    const page = await this.page();
+    const picker = page
+      .locator("[data-testid='composer-intelligence-picker-content']:visible")
+      .last();
+    if (!(await picker.isVisible().catch(() => false))) return null;
+
+    const simpleView = picker
+      .locator("[data-testid='composer-model-picker-slider-simple-view']")
+      .last();
+    const advancedView = picker
+      .locator("[data-testid='composer-model-picker-slider-advanced-view']")
+      .last();
+    const toggle = picker
+      .locator(
+        "[role='menuitem'][aria-label='Select model'], [role='menuitem'][aria-label='选择模型']",
+      )
+      .last();
+    const slider = simpleView.locator("[role='slider']").last();
+    const checkedModel = advancedView
+      .locator("[role='menuitemradio'][aria-checked='true']")
+      .last();
+    if (
+      !(await simpleView.count()) ||
+      !(await advancedView.count()) ||
+      !(await toggle.count()) ||
+      !(await slider.count()) ||
+      !(await checkedModel.count())
+    ) {
+      return null;
+    }
+
+    const thinkingLevel = parseAnswerTier(await toggle.innerText().catch(() => ""));
+    const model = (await checkedModel.innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+    if (!thinkingLevel || !model) return null;
+
+    return {
+      layout: "direct-picker",
+      picker,
+      slider,
+      modelRow: {
+        label: "Model",
+        locator: toggle,
+        text: `Model ${model}`,
+        value: model,
+      },
+      thinkingRow: {
+        label: "Thinking effort",
+        locator: slider,
+        text: `Thinking effort ${thinkingLevel}`,
+        value: thinkingLevel,
+      },
+    };
+  }
+
   async openAdvancedSettings() {
     await this.ensureSignedIn();
     const page = await this.page();
@@ -2006,6 +2630,9 @@ export class ChatGPTBrowser {
     }
     await this.click(trigger, "open-advanced-settings");
     await page.waitForTimeout(180);
+
+    const direct = await this.directAdvancedSettings();
+    if (direct) return direct;
 
     modelRow = await this.advancedRow(SELECTORS.modelRowLabels);
     thinkingRow = await this.advancedRow(SELECTORS.thinkingRowLabels);
@@ -2209,9 +2836,20 @@ export class ChatGPTBrowser {
   }
 
   async listThinkingLevels() {
-    const page = await this.page();
-    const { modelRow, thinkingRow } = await this.openAdvancedSettings();
+    const { modelRow, thinkingRow, layout, slider: directSlider } =
+      await this.openAdvancedSettings();
     const current = thinkingRow.value;
+    if (layout === "direct-picker") {
+      const slider = await this.answerTierSliderState(directSlider);
+      await this.closeAdvancedMenus();
+      return {
+        current,
+        levels: [],
+        control: { type: "slider", ...slider, current },
+        note:
+          "当前网页把思考强度直接显示为 Power 滑杆；返回其当前语义和值域。",
+      };
+    }
     await this.clickAdvancedRow(thinkingRow);
     const levels = await this.visibleMenuOptions({
       exclude: [modelRow.text, thinkingRow.text],
@@ -2299,10 +2937,72 @@ export class ChatGPTBrowser {
 
   async selectThinkingLevel(thinkingLevel) {
     const page = await this.page();
-    const { modelRow, thinkingRow } = await this.openAdvancedSettings();
+    const opened = await this.openAdvancedSettings();
+    const { modelRow, thinkingRow } = opened;
     if (normalize(thinkingRow.value) === normalize(thinkingLevel)) {
       await this.closeAdvancedMenus();
       return { requested: thinkingLevel, selected: thinkingRow.value, changed: false };
+    }
+    if (opened.layout === "direct-picker") {
+      const sliderState = await this.answerTierSliderState(opened.slider);
+      const min = Number(sliderState?.min);
+      const max = Number(sliderState?.max);
+      const original = Number(sliderState?.now);
+      if (
+        !Number.isFinite(min) ||
+        !Number.isFinite(max) ||
+        !Number.isFinite(original) ||
+        max < min ||
+        max - min > 20
+      ) {
+        await this.closeAdvancedMenus();
+        throw new ChatGPTWebError("思考强度滑块没有公开可安全遍历的范围。", {
+          requested: thinkingLevel,
+          slider: sliderState,
+        });
+      }
+
+      const available = [];
+      await opened.slider.focus();
+      await this.press(opened.slider, "Home", "thinking-slider-home");
+      for (let position = min; position <= max; position += 1) {
+        await page.waitForTimeout(100);
+        const observed = parseAnswerTier(
+          await opened.modelRow.locator.innerText().catch(() => ""),
+        );
+        if (observed) available.push(observed);
+        if (normalize(observed) === normalize(thinkingLevel)) {
+          await this.closeAdvancedMenus();
+          const selected = await this.answerTierControlLabel();
+          if (normalize(selected) !== normalize(thinkingLevel)) {
+            throw new ChatGPTWebError("思考强度切换后未通过页面校验。", {
+              requested: thinkingLevel,
+              observed: selected,
+            });
+          }
+          this.rememberSettings(modelRow.value, selected);
+          return {
+            requested: thinkingLevel,
+            selected,
+            changed: original !== position,
+            available,
+            verifiedBy: "power-slider-label",
+          };
+        }
+        if (position < max) {
+          await this.press(opened.slider, "ArrowRight", "thinking-slider-increment");
+        }
+      }
+
+      await this.press(opened.slider, "Home", "thinking-slider-restore-home");
+      for (let position = min; position < original; position += 1) {
+        await this.press(opened.slider, "ArrowRight", "thinking-slider-restore");
+      }
+      await this.closeAdvancedMenus();
+      throw new ChatGPTWebError("请求的思考强度不在当前 Power 滑杆中。", {
+        requested: thinkingLevel,
+        available,
+      });
     }
     await this.clickAdvancedRow(thinkingRow);
     const options = await this.visibleMenuOptions({
@@ -2366,24 +3066,143 @@ export class ChatGPTBrowser {
     await this.ensureSignedIn();
     const composer = await this.composer();
     if (!composer) throw new ChatGPTWebError("没有找到提示词输入框。");
+    await this.assertComposerWritable("write-prompt", composer);
 
-    if (append) await this.type(composer, prompt, "append-prompt");
+    const before = await this.composerText(composer);
+    const action = promptWriteAction(before, prompt, { append });
+    if (action === "reject-nonempty") {
+      throw new ChatGPTWebError(
+        "输入框已有用户草稿，已拒绝覆盖。请使用 append=true 或由用户先清空草稿。",
+        {
+          existingCharacters: before.length,
+          existingPreview: before.slice(0, 160),
+          requestedCharacters: prompt.length,
+          overwritePrevented: true,
+        },
+      );
+    }
+    if (action === "already-present") {
+      return {
+        written: false,
+        alreadyPresent: true,
+        protected: true,
+        characters: before.length,
+        preview: before.slice(0, 300),
+      };
+    }
+
+    // React's contenteditable composer can drop characters when a long
+    // append is sent through Playwright's per-keystroke `type()`.  Append is
+    // already explicitly authorized by the caller, so update the complete
+    // value atomically and preserve the exact existing draft.
+    if (action === "append") await this.fill(composer, `${before}${prompt}`, "append-prompt");
     else await this.fill(composer, prompt, "write-prompt");
 
-    const value = await composer.evaluate((element) => {
-      if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-        return element.value;
-      }
-      return element.innerText || element.textContent || "";
-    });
+    // Do not validate the rendered composer text after writing. ChatGPT may
+    // normalize whitespace or insert capability pills (for example Web
+    // search), so a post-write text comparison can reject a successful write
+    // and leave the request in an ambiguous state. The pre-write draft guard
+    // above still protects user-owned text from accidental replacement.
+    const value = await this.composerText(composer).catch(() => "");
+    return {
+      written: true,
+      verificationSkipped: true,
+      characters: value.length,
+      preview: value.slice(0, 300),
+    };
+  }
 
-    if (!normalize(value).includes(normalize(prompt))) {
-      throw new ChatGPTWebError("提示词已写入，但输入框内容校验失败。", {
-        observedLength: value.length,
-        requestedLength: prompt.length,
+  async webSearchState() {
+    const composer = await this.composer();
+    const hint = composer.locator(SELECTORS.webSearchHints.join(", ")).first();
+    const selected =
+      (await hint.count()) > 0 && (await hint.isVisible().catch(() => false));
+    return {
+      selected,
+      label: selected
+        ? (await hint.innerText().catch(() => "")).replace(/\s+/g, " ").trim() || null
+        : null,
+    };
+  }
+
+  async waitForWebSearchSelection({ timeoutMs = 2_000, pollMs = 50 } = {}) {
+    const page = await this.page();
+    const deadline = Date.now() + timeoutMs;
+    let state = await this.webSearchState();
+    while (!state.selected && Date.now() < deadline) {
+      await page.waitForTimeout(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+      state = await this.webSearchState();
+    }
+    return state;
+  }
+
+  async enableWebSearch() {
+    await this.ensureSignedIn();
+    const current = await this.webSearchState();
+    if (current.selected) return { ...current, changed: false };
+
+    const page = await this.page();
+    const menuButton = await this.firstVisible(SELECTORS.attachmentButton, { timeout: 1_500 });
+    if (!menuButton) {
+      throw new ChatGPTWebError("没有找到 ChatGPT 输入框的能力菜单。", {
+        url: page.url(),
       });
     }
-    return { written: true, characters: value.length, preview: value.slice(0, 300) };
+    await this.click(menuButton, "open-composer-menu-for-web-search");
+    await page.waitForTimeout(250);
+
+    let item = null;
+    for (const label of ["Web search", "网页搜索"]) {
+      // The page can already contain a Web search pill in an older assistant
+      // message.  Selecting the first text match therefore clicks stale
+      // content instead of the newly opened composer menu.  Current ChatGPT
+      // menu entries expose `data-fill` and `tabindex=0`; prefer those and
+      // keep role/class fallbacks for older layouts.
+      const selectors = [
+        "[data-fill][tabindex='0']",
+        ".group.__menu-item[tabindex='0']",
+        "[role='menuitem'], [role='menuitemradio'], [role='option']",
+      ];
+      for (const selector of selectors) {
+        const matches = page.locator(selector).filter({ hasText: label });
+        for (let index = 0; index < (await matches.count()); index += 1) {
+          const candidate = matches.nth(index);
+          if (!(await candidate.isVisible().catch(() => false))) continue;
+          const isComposerPill = await candidate
+            .evaluate((element) => Boolean(element.closest("[contenteditable='true']")))
+            .catch(() => false);
+          if (isComposerPill) continue;
+          item = candidate;
+          break;
+        }
+        if (item) break;
+      }
+      if (item) break;
+    }
+    if (!item) {
+      await this.keyboardPress(page, "Escape", "close-composer-menu").catch(() => {});
+      throw new ChatGPTWebError(
+        "当前账号、工作区或页面版本没有显示“网页搜索”能力。",
+        { url: page.url() },
+      );
+    }
+
+    const interactive = item.locator(
+      "xpath=ancestor-or-self::*[self::button or @role='button' or @role='menuitem' or @role='menuitemradio' or @tabindex][1]",
+    );
+    await this.domClick((await interactive.count()) > 0 ? interactive : item, "enable-web-search");
+    await page.waitForTimeout(250);
+
+    // The composer inserts the inline selection pill asynchronously. A fixed
+    // 250 ms sleep races the UI on slower pages and reported a false failure
+    // even though the click had succeeded.
+    const verified = await this.waitForWebSearchSelection();
+    if (!verified.selected) {
+      throw new ChatGPTWebError("已点击“网页搜索”，但输入框未出现选中标记。", {
+        url: page.url(),
+      });
+    }
+    return { ...verified, changed: true };
   }
 
   async validateFiles(files) {
@@ -2460,32 +3279,416 @@ export class ChatGPTBrowser {
     };
   }
 
+  /**
+   * Return the message nodes that represent one message each.  New ChatGPT
+   * layouts put a role node inside a section wrapper; SELECTORS excludes such
+   * wrappers, so this remains compatible with older section-only layouts.
+   */
+  async renderedConversationMessages() {
+    const page = await this.page();
+    const selector = [
+      ...SELECTORS.userMessages,
+      ...SELECTORS.assistantMessages,
+    ].join(", ");
+    return page.locator(selector).evaluateAll((elements) =>
+      elements.map((element, index) => ({
+        index,
+        author:
+          element.getAttribute("data-message-author-role") ||
+          element.getAttribute("data-turn") ||
+          null,
+        id:
+          element.getAttribute("data-message-id") ||
+          element.getAttribute("data-testid") ||
+          element.id ||
+          null,
+        text: element.innerText || element.textContent || "",
+      })),
+    );
+  }
+
+  async conversationApiTranscript() {
+    const page = await this.page();
+    const currentUrl = typeof page.url === "function" ? page.url() : "";
+    if (!this.#context || typeof page.evaluate !== "function") {
+      return { available: false, messages: [], error: "page-evaluate-unavailable" };
+    }
+    const conversationId = conversationIdFromUrl(currentUrl);
+    if (!conversationId) return { available: false, messages: [], error: "no-conversation-id" };
+    // Only reuse headers already observed from the user's current page.
+    // Do not open an extra conversation page just to prime an API request.
+    if (!this.#apiHeaders.authorization) {
+      return { available: false, messages: [], error: "api-headers-unavailable" };
+    }
+    await this.siteAction("read-history-api");
+    const cookieHeader = (await this.#context.cookies("https://chatgpt.com").catch(() => []))
+      .map((cookie) => `${cookie.name}=${cookie.value}`)
+      .join("; ");
+    const endpoint = `${CHATGPT_URL.replace(/\/$/u, "")}/backend-api/conversations/${encodeURIComponent(conversationId)}?include_has_versions=true&num_turns=100`;
+    const requestApi = () =>
+      fetch(endpoint, {
+        headers: {
+          ...this.#apiHeaders,
+          accept: "application/json",
+          ...(cookieHeader ? { cookie: cookieHeader } : {}),
+          referer: currentUrl,
+          "x-openai-target-path": `/backend-api/conversations/${conversationId}`,
+          "x-openai-target-route": "/backend-api/conversations/{conversation_id}",
+        },
+      }).catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
+    const response = await requestApi();
+    const responseBody = response.ok ? await response.json().catch(() => null) : null;
+    if (!response.ok || !responseBody) {
+      return {
+        available: false,
+        messages: [],
+        status: response.status || null,
+        error: response.error || `http-${response.status || "unknown"}`,
+      };
+    }
+    return {
+      available: true,
+      messages: parseConversationApiTranscript(responseBody),
+      status: response.status,
+    };
+  }
+
+  async transcriptScrollMetrics() {
+    const page = await this.page();
+    return page.evaluate(() => {
+      const anchor =
+        document.querySelector("[data-message-author-role]") ||
+        document.querySelector("section[data-turn], article[data-turn]");
+      let element = anchor;
+      while (element) {
+        const style = getComputedStyle(element);
+        if (
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          element.scrollHeight > element.clientHeight
+        ) {
+          return {
+            available: true,
+            top: element.scrollTop,
+            scrollHeight: element.scrollHeight,
+            clientHeight: element.clientHeight,
+          };
+        }
+        element = element.parentElement;
+      }
+      const fallback = document.scrollingElement;
+      return {
+        available: Boolean(fallback && fallback.scrollHeight > fallback.clientHeight),
+        top: fallback?.scrollTop || 0,
+        scrollHeight: fallback?.scrollHeight || 0,
+        clientHeight: fallback?.clientHeight || 0,
+      };
+    });
+  }
+
+  async scrollTranscriptToTop() {
+    const page = await this.page();
+    return page.evaluate(() => {
+      const anchor =
+        document.querySelector("[data-message-author-role]") ||
+        document.querySelector("section[data-turn], article[data-turn]");
+      let element = anchor;
+      while (element) {
+        const style = getComputedStyle(element);
+        if (
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          element.scrollHeight > element.clientHeight
+        ) {
+          element.scrollTop = 0;
+          element.dispatchEvent(new Event("scroll", { bubbles: true }));
+          return true;
+        }
+        element = element.parentElement;
+      }
+      if (document.scrollingElement) {
+        document.scrollingElement.scrollTop = 0;
+        window.scrollTo(0, 0);
+        return true;
+      }
+      return false;
+    });
+  }
+
+  async restoreTranscriptScroll(top) {
+    const page = await this.page();
+    await page.evaluate((desiredTop) => {
+      const anchor =
+        document.querySelector("[data-message-author-role]") ||
+        document.querySelector("section[data-turn], article[data-turn]");
+      let element = anchor;
+      while (element) {
+        const style = getComputedStyle(element);
+        if (
+          (style.overflowY === "auto" || style.overflowY === "scroll") &&
+          element.scrollHeight > element.clientHeight
+        ) {
+          element.scrollTop = Math.max(
+            0,
+            Math.min(Number(desiredTop) || 0, element.scrollHeight - element.clientHeight),
+          );
+          return;
+        }
+        element = element.parentElement;
+      }
+      window.scrollTo(0, Number(desiredTop) || 0);
+    }, top);
+  }
+
+  /**
+   * ChatGPT virtualizes long conversations and loads older turns when the
+   * transcript scroller reaches its top.  Count/archival code must therefore
+   * walk to the top and retain every message observed, instead of trusting
+   * the shallow DOM snapshot at the current viewport.
+   */
+  async loadCompleteTranscript({ maxPasses = 40, waitMs = 450, restoreScroll = true } = {}) {
+    const apiTranscript = await this.conversationApiTranscript();
+    if (apiTranscript.available) {
+      return {
+        messages: apiTranscript.messages,
+        messageCount: apiTranscript.messages.length,
+        userMessageCount: apiTranscript.messages.filter((message) => message.author === "user").length,
+        assistantMessageCount: apiTranscript.messages.filter((message) => message.author === "assistant").length,
+        passes: 0,
+        complete: true,
+        source: "conversation-api",
+        initialScrollTop: null,
+      };
+    }
+    const initial = await this.transcriptScrollMetrics();
+    const initialTop = initial.top;
+    const messagesByKey = new Map();
+    let orderedKeys = [];
+    let passes = 0;
+    let stablePasses = 0;
+    let complete = !initial.available;
+
+    const collect = async () => {
+      const entries = await this.renderedConversationMessages();
+      const currentKeys = [];
+      for (const entry of entries) {
+        if (entry.author !== "user" && entry.author !== "assistant") continue;
+        const text = String(entry.text || "");
+        const key = entry.id
+          ? `${entry.author}:id:${entry.id}`
+          : `${entry.author}:text:${normalize(text).slice(0, 2_000)}`;
+        currentKeys.push(key);
+        messagesByKey.set(key, {
+          author: entry.author,
+          id: entry.id,
+          text,
+        });
+      }
+      const currentSet = new Set(currentKeys);
+      orderedKeys = [
+        ...currentKeys,
+        ...orderedKeys.filter((key) => !currentSet.has(key)),
+      ];
+      return {
+        count: messagesByKey.size,
+        currentCount: currentKeys.length,
+      };
+    };
+
+    await collect();
+    const safePasses = Math.max(1, Math.min(Number(maxPasses) || 40, 120));
+    const safeWaitMs = Math.max(100, Math.min(Number(waitMs) || 450, 2_000));
+    while (!complete && passes < safePasses) {
+      const beforeCount = messagesByKey.size;
+      await this.scrollTranscriptToTop();
+      await (await this.page()).waitForTimeout(safeWaitMs);
+      passes += 1;
+      await collect();
+      const metrics = await this.transcriptScrollMetrics();
+      const added = messagesByKey.size > beforeCount;
+      if (added || metrics.top > 1) stablePasses = 0;
+      else stablePasses += 1;
+      if (!metrics.available || stablePasses >= 2) complete = true;
+    }
+
+    if (restoreScroll && initial.available) {
+      await this.restoreTranscriptScroll(initialTop);
+    }
+    const messages = orderedKeys
+      .map((key) => messagesByKey.get(key))
+      .filter(Boolean);
+    return {
+      messages,
+      messageCount: messages.length,
+      userMessageCount: messages.filter((message) => message.author === "user").length,
+      assistantMessageCount: messages.filter((message) => message.author === "assistant").length,
+      passes,
+      complete,
+      source: "dom-scroll",
+      initialScrollTop: initialTop,
+    };
+  }
+
   assistantLocator() {
-    return this.#page.locator(SELECTORS.assistantMessages.join(", "));
+    return this.#page
+      .locator(SELECTORS.assistantMessages.join(", "))
+      .filter({ hasNotText: THINKING_WRAPPER_RE });
   }
 
   userLocator() {
     return this.#page.locator(SELECTORS.userMessages.join(", "));
   }
 
-  async submitPrompt({ wait = true, timeoutMs = RESPONSE_TIMEOUT_MS } = {}) {
+  async userMessageSnapshot() {
+    const users = this.userLocator();
+    const count = await users.count();
+    if (!count) return { count: 0, lastText: "", lastId: null };
+    const last = users.last();
+    const detail = await last.evaluate((element) => ({
+      text: element.innerText || element.textContent || "",
+      lastId:
+        element.getAttribute("data-message-id") ||
+        element.getAttribute("data-testid") ||
+        element.id ||
+        null,
+    }));
+    return { count, lastText: detail.text, lastId: detail.lastId };
+  }
+
+  async conversationTurnStats() {
+    const page = await this.page();
+    const [transcript, body] = await Promise.all([
+      this.loadCompleteTranscript(),
+      page.locator("body").innerText().catch(() => ""),
+    ]);
+    const { userMessageCount, assistantMessageCount } = transcript;
+    const lengthLimitDetected = classifyConversationLengthText(body).limited;
+    const state = conversationTurnLimitState(
+      { userMessageCount, assistantMessageCount, lengthLimitDetected },
+      MAX_CONVERSATION_TURNS,
+    );
+    return {
+      ...state,
+      conversationId: conversationIdFromUrl(page.url()),
+      url: page.url(),
+      transcriptMessageCount: transcript.messageCount,
+      transcriptLoaded: transcript.complete,
+      transcriptLoadPasses: transcript.passes,
+      transcriptSource: transcript.source || "unknown",
+    };
+  }
+
+  async archiveConversation({ reason = "conversation-limit", stats = null } = {}) {
+    const page = await this.page();
+    const conversationId = conversationIdFromUrl(page.url()) || "unknown";
+    const transcript = await this.loadCompleteTranscript({ restoreScroll: false });
+    const turns = [];
+    const roleCounts = { user: 0, assistant: 0 };
+    for (const message of transcript.messages) {
+      const text = message.text.trim();
+      if (!text || !(message.author in roleCounts)) continue;
+      roleCounts[message.author] += 1;
+      const label = message.author === "user" ? "User" : "Assistant";
+      turns.push(`## ${label} ${roleCounts[message.author]}\n\n${text}`);
+    }
+    const now = new Date();
+    const stamp = now.toISOString().replace(/[:.]/g, "-");
+    const safeConversationId = conversationId.replace(/[^a-zA-Z0-9_-]/g, "_");
+    const fileName = `${stamp}_${safeConversationId}.md`;
+    const outputPath = path.join(CONTEXT_ARCHIVE_DIR, fileName);
+    const metadata = stats || await this.conversationTurnStats();
+    const content = [
+      "# ChatGPT conversation archive",
+      "",
+      `- archived_at: ${now.toISOString()}`,
+      `- conversation_id: ${conversationId}`,
+      `- source_url: ${page.url()}`,
+      `- reason: ${reason}`,
+      `- turn_count: ${metadata.turnCount}`,
+      `- user_message_count: ${metadata.userMessageCount}`,
+      `- assistant_message_count: ${metadata.assistantMessageCount}`,
+      `- transcript_message_count: ${transcript.messageCount}`,
+      `- transcript_load_passes: ${transcript.passes}`,
+      `- transcript_source: ${transcript.source || "unknown"}`,
+      "",
+      ...turns,
+      turns.length ? "" : "(No complete transcript was available.)",
+      "",
+    ].join("\n");
+    await fs.mkdir(CONTEXT_ARCHIVE_DIR, { recursive: true });
+    const temporaryPath = `${outputPath}.${process.pid}.tmp`;
+    await fs.writeFile(temporaryPath, content, { mode: 0o600 });
+    await fs.rename(temporaryPath, outputPath);
+    return {
+      archived: true,
+      archivePath: outputPath,
+      conversationId,
+      turnCount: metadata.turnCount,
+      userMessageCount: metadata.userMessageCount,
+      assistantMessageCount: metadata.assistantMessageCount,
+      transcriptMessageCount: transcript.messageCount,
+      transcriptLoadPasses: transcript.passes,
+    };
+  }
+
+  async ensureConversationCapacity({ allowRotate = false } = {}) {
+    const stats = await this.conversationTurnStats();
+    if (!stats.shouldRotate) return { rotated: false, stats };
+    if (!allowRotate) {
+      throw new ChatGPTWebError(
+        "当前对话已达到自动轮换阈值，发送已拦截；请先新建对话。",
+        {
+          conversationRotationRequired: true,
+          maxConversationTurns: stats.limit,
+          ...stats,
+          nextStep: "调用 chatgpt_new_chat 或 chatgpt_route_new_chat 后重新发送。",
+        },
+      );
+    }
+    const archive = await this.archiveConversation({
+      reason: stats.lengthLimitDetected ? "page-length-limit" : "turn-limit",
+      stats,
+    });
+    const previousConversationId = stats.conversationId;
+    const root = await this.newChat({ temporary: false }, { includeStatus: false });
+    return {
+      rotated: true,
+      previousConversationId,
+      previousUrl: stats.url,
+      archive,
+      newConversation: root,
+      stats,
+    };
+  }
+
+  async submitPrompt({
+    wait = true,
+    timeoutMs = RESPONSE_TIMEOUT_MS,
+    refresh = true,
+  } = {}) {
+    const refreshResult = refresh
+      ? await this.refreshBeforeSend({ reason: "submit-prompt" })
+      : null;
     await this.ensureSignedIn();
     const page = await this.page();
+    // Direct write_prompt → submit_prompt callers must be stopped before a
+    // capped conversation can trigger the server-side banner.  Atomic
+    // sendMessage performs the safe archive-and-rotate path instead.
+    const capacity = await this.ensureConversationCapacity({ allowRotate: false });
     const composer = await this.composer();
     if (!composer) throw new ChatGPTWebError("没有找到提示词输入框。");
-    const promptText = await composer.evaluate((element) =>
-      element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement
-        ? element.value
-        : element.innerText || element.textContent || "",
-    );
+    await this.assertComposerWritable("submit-prompt", composer);
+    const promptText = await this.composerText(composer);
     if (!normalize(promptText)) throw new ChatGPTWebError("输入框为空，无法发送。");
 
     const assistantBefore = await this.assistantLocator().count();
-    const userBefore = await this.userLocator().count();
+    const assistantBeforeText = assistantBefore
+      ? await this.assistantLocator().last().innerText().catch(() => "")
+      : "";
+    const userBeforeSnapshot = await this.userMessageSnapshot();
+    const userBefore = userBeforeSnapshot.count;
     await this.siteAction("send-prompt");
     const send = await this.firstVisible(SELECTORS.sendButton, { timeout: 1_000 });
     if (send && (await send.isEnabled().catch(() => true))) {
-      await this.click(send, "send-prompt-click");
+      await this.domClick(send, "send-prompt-click");
     } else {
       await this.press(composer, "Enter", "send-prompt-enter");
     }
@@ -2499,6 +3702,7 @@ export class ChatGPTBrowser {
         url: page.url(),
         ownerPid: process.pid,
         assistantBefore,
+        baselineResponse: assistantBeforeText,
         status: wait ? "waiting" : "unobserved",
       },
     });
@@ -2512,12 +3716,44 @@ export class ChatGPTBrowser {
       { timeout: ACTION_TIMEOUT_MS },
     ).catch(() => {});
 
+    const userAfterSnapshot = await this.userMessageSnapshot();
+    const userMessageAppendVerified =
+      userAfterSnapshot.count > userBeforeSnapshot.count ||
+      (Boolean(userBeforeSnapshot.lastId) &&
+        Boolean(userAfterSnapshot.lastId) &&
+        userBeforeSnapshot.lastId !== userAfterSnapshot.lastId);
+    const sameTurn =
+      userBeforeSnapshot.count === userAfterSnapshot.count &&
+      userBeforeSnapshot.lastId &&
+      userBeforeSnapshot.lastId === userAfterSnapshot.lastId;
+    if (
+      sameTurn &&
+      normalize(userBeforeSnapshot.lastText) !== normalize(userAfterSnapshot.lastText) &&
+      normalize(userAfterSnapshot.lastText) === normalize(promptText)
+    ) {
+      throw new ChatGPTWebError(
+        "发送后未创建新的用户消息，检测到原用户消息内容被替换；已停止后续网页操作。",
+        {
+          overwriteDetected: true,
+          userMessageCount: userAfterSnapshot.count,
+          userMessageId: userAfterSnapshot.lastId,
+          previousCharacters: userBeforeSnapshot.lastText.length,
+          observedCharacters: userAfterSnapshot.lastText.length,
+          nextStep: "请人工恢复原消息后再继续；本工具不会自动重试或再次发送。",
+        },
+      );
+    }
+
     if (!wait) {
       return {
         sent: true,
         waiting: false,
         url: page.url(),
         conversationId: conversationIdFromUrl(page.url()),
+        userMessageAppendVerified,
+        userMessageCountBefore: userBeforeSnapshot.count,
+        userMessageCountAfter: userAfterSnapshot.count,
+        pageRefreshedBeforeSend: Boolean(refreshResult),
       };
     }
     const effectiveTimeoutMs =
@@ -2527,10 +3763,18 @@ export class ChatGPTBrowser {
     try {
       const result = await this.waitForResponse({
         assistantBefore,
+        baselineResponse: assistantBeforeText,
         timeoutMs: effectiveTimeoutMs,
+        conversationCapacity: capacity,
       });
       await updateRuntimeState({ activeGeneration: null, lastGenerationCompletedAt: Date.now() });
-      return result;
+      return {
+        ...result,
+        userMessageAppendVerified,
+        userMessageCountBefore: userBeforeSnapshot.count,
+        userMessageCountAfter: userAfterSnapshot.count,
+        pageRefreshedBeforeSend: Boolean(refreshResult),
+      };
     } catch (error) {
       if (this.signal()?.aborted) {
         await updateRuntimeState({
@@ -2540,15 +3784,33 @@ export class ChatGPTBrowser {
             url: page.url(),
             ownerPid: null,
             assistantBefore,
+            baselineResponse: assistantBeforeText,
             status: "client-cancelled-generation-may-continue",
           },
         });
+      } else {
+        // A client-side timeout must not leave a completed/non-generating page
+        // permanently locked. Keep the lock only while the page still shows
+        // an active generation; getLatestResponse can then clear it once the
+        // final text is observable. This check does not fetch history.
+        const latest = await this.getLatestResponse({ includeTranscript: false }).catch(() => null);
+        if (latest && !latest.generating) {
+          await updateRuntimeState({
+            activeGeneration: null,
+            lastGenerationInterruptedAt: Date.now(),
+          });
+        }
       }
       throw error;
     }
   }
 
-  async waitForResponse({ assistantBefore, timeoutMs = RESPONSE_TIMEOUT_MS } = {}) {
+  async waitForResponse({
+    assistantBefore,
+    baselineResponse = "",
+    timeoutMs = RESPONSE_TIMEOUT_MS,
+    conversationCapacity = null,
+  } = {}) {
     const page = await this.page();
     const signal = this.signal();
     throwIfAborted(signal);
@@ -2556,7 +3818,7 @@ export class ChatGPTBrowser {
       assistantBefore ?? Math.max(0, (await this.assistantLocator().count()) - 1);
     const unlimited = timeoutMs == null;
     const observerPromise = page.evaluate(
-      ({ assistantSelectors, stopSelectors, baselineCount, timeout }) =>
+      ({ assistantSelectors, stopSelectors, baselineCount, baselineResponse, timeout }) =>
         new Promise((resolve) => {
           const visible = (element) => {
             if (!(element instanceof HTMLElement)) return false;
@@ -2569,12 +3831,24 @@ export class ChatGPTBrowser {
             const rateLimited =
               /请求过于频繁|too many requests|request.*too frequent/i.test(body) &&
               /稍等|分钟|try again|wait/i.test(body);
-            const assistant = [...document.querySelectorAll(assistantSelectors)];
+            const assistant = [...document.querySelectorAll(assistantSelectors)].filter(
+              (element) =>
+                !/^\s*(?:thinking|思考)(?:\s*(?:[.…:：]|$))/iu.test(
+                  element.innerText || element.textContent || "",
+                ),
+            );
             const last = assistant.at(-1);
             const response = (last?.innerText || last?.textContent || "").trim();
             const stop = [...document.querySelectorAll(stopSelectors)].some(visible);
+            // Deep-research/web-search responses can expose a progress-only
+            // assistant node (for example "Planning …") without a stop
+            // button or the legacy streaming marker.  Treat its shimmer as
+            // active generation; otherwise waitForResponse returns before
+            // the final answer is attached to the same assistant node.
             const streaming = Boolean(
-              last?.querySelector("[data-is-streaming='true'], .result-streaming"),
+              last?.querySelector(
+                "[data-is-streaming='true'], .result-streaming, [class*='loading-shimmer'], [data-testid*='thinking']",
+              ),
             );
             return { count: assistant.length, response, stop, streaming, rateLimited };
           };
@@ -2605,8 +3879,11 @@ export class ChatGPTBrowser {
               stableSince = Date.now();
             }
             clearTimeout(stableTimer);
+            const hasNewResponse =
+              state.count > baselineCount ||
+              (Boolean(state.response) && state.response !== baselineResponse);
             if (
-              state.count > baselineCount &&
+              hasNewResponse &&
               state.response &&
               !state.stop &&
               !state.streaming
@@ -2614,8 +3891,11 @@ export class ChatGPTBrowser {
               const remaining = Math.max(0, 2_000 - (Date.now() - stableSince));
               stableTimer = setTimeout(() => {
                 const verified = read();
+                const verifiedHasNewResponse =
+                  verified.count > baselineCount ||
+                  (Boolean(verified.response) && verified.response !== baselineResponse);
                 if (
-                  verified.count > baselineCount &&
+                  verifiedHasNewResponse &&
                   verified.response === stableText &&
                   !verified.stop &&
                   !verified.streaming
@@ -2652,6 +3932,7 @@ export class ChatGPTBrowser {
         assistantSelectors: SELECTORS.assistantMessages.join(", "),
         stopSelectors: SELECTORS.stopButton.join(", "),
         baselineCount: baseline,
+        baselineResponse,
         timeout: unlimited ? null : timeoutMs,
       },
     );
@@ -2681,6 +3962,19 @@ export class ChatGPTBrowser {
         url: page.url(),
       });
     }
+    const lengthLimit = classifyConversationLengthText(observed.response);
+    if (lengthLimit.limited) {
+      throw new ChatGPTWebError(
+        "ChatGPT 拒绝了本次发送：当前对话已达到长度上限。",
+        {
+          conversationRotationRequired: true,
+          maxConversationTurns: MAX_CONVERSATION_TURNS,
+          conversationId: conversationIdFromUrl(page.url()),
+          response: observed.response,
+          nextStep: "调用 chatgpt_new_chat 或 chatgpt_route_new_chat 后重新发送。",
+        },
+      );
+    }
     return {
       sent: true,
       completed: true,
@@ -2696,12 +3990,14 @@ export class ChatGPTBrowser {
       waitMechanism: "mutation-observer",
       rateLimited: false,
       rateLimitScope: null,
+      conversationCapacity,
     };
   }
 
   async sendMessage({
     prompt,
     files = [],
+    webSearch = false,
     model,
     mode,
     thinkingLevel,
@@ -2711,27 +4007,60 @@ export class ChatGPTBrowser {
     wait = true,
     timeoutMs = RESPONSE_TIMEOUT_MS,
   }) {
+    let rotation = null;
     if (newChat || temporary) {
       await this.newChat(
         { temporary, model, mode, thinkingLevel, answerTier },
         { includeStatus: false },
       );
     } else {
+      rotation = await this.ensureConversationCapacity({ allowRotate: true });
+      // An archived historical thread has no composer or settings trigger.
+      // Restore it before applying optional settings so a requested
+      // thinkingLevel/high tier does not fail with a misleading missing
+      // control error.
+      await this.unarchiveConversationIfNeeded();
       if (mode) await this.selectMode(mode);
       if (model) await this.selectModel(model);
       if (thinkingLevel) await this.selectThinkingLevel(thinkingLevel);
       if (answerTier) await this.selectAnswerTier(answerTier);
     }
+    // Refresh after conversation/settings changes and before any upload or
+    // composer mutation.  This prevents a stale page tree from targeting an
+    // existing user turn while keeping attachments intact.
+    const refreshResult = await this.refreshBeforeSend({ reason: "send-message" });
     if (files.length) await this.uploadFiles(files);
     await this.writePrompt(prompt);
+    const search = webSearch ? await this.enableWebSearch() : { selected: false };
     const effectiveTimeoutMs =
       isProModel(model) || isProTier(answerTier) || isProTier(this.#answerTier)
         ? null
         : timeoutMs;
-    return this.submitPrompt({ wait, timeoutMs: effectiveTimeoutMs });
+    const result = await this.submitPrompt({
+      wait,
+      timeoutMs: effectiveTimeoutMs,
+      refresh: false,
+    });
+    return {
+      ...result,
+      webSearch: search,
+      pageRefreshedBeforeSend: refreshResult.refreshed,
+      conversationRotation: rotation,
+    };
+  }
+
+  assertProbeEnabled() {
+    if (!PROBE_ENABLED) {
+      throw new ChatGPTWebError("临时 Pro 身份探针默认停用；未打开临时对话，也未发送测试消息。", {
+        probeEnabled: false,
+        configuration: "CHATGPT_WEB_PROBE_ENABLED=false",
+        nextStep: "使用 requestPro=false 的普通极高路由；仅在明确需要实验性身份探针时手动启用该配置。",
+      });
+    }
   }
 
   async probeProIdentity({ mode, force = false } = {}) {
+    this.assertProbeEnabled();
     if (!force) {
       const runtime = await readRuntimeState();
       const session = await browserSessionSnapshot();
@@ -2742,10 +4071,11 @@ export class ChatGPTBrowser {
         }
         return {
           prompt: PROBE_PROMPT,
-          response: cached.response,
+          modelSlug: cached.modelSlug || null,
+          modelSlugSource: cached.modelSlug ? "conversation-response" : null,
           classification: cached.classification,
           temporary: true,
-          answerTier: PRO_ANSWER_TIER,
+          answerTier: cached.answerTier || null,
           url: cached.url || null,
           waitPolicy: "cached-probe",
           cachePolicy: cached.sessionInterruptedAt
@@ -2761,16 +4091,27 @@ export class ChatGPTBrowser {
       }
     }
 
-    await this.newChat(
-      { temporary: true, mode, answerTier: PRO_ANSWER_TIER },
-      { includeStatus: false },
-    );
+    // The visible Pro tier may be unavailable even when the backend serves a
+    // valid non-mini model. Identity is determined by model_slug, so probe the
+    // temporary chat at the currently available tier instead of failing early
+    // while trying to select an unavailable UI option.
+    await this.newChat({ temporary: true, mode }, { includeStatus: false });
+    const refreshResult = await this.refreshBeforeSend({ reason: "probe-pro-identity" });
     await this.writePrompt(PROBE_PROMPT);
-    const result = await this.submitPrompt({ wait: true, timeoutMs: null });
+    const captured = await this.captureConversationModelSlug(() =>
+      this.submitPrompt({ wait: true, timeoutMs: null, refresh: false }),
+    );
+    const result = captured.result;
+    const modelSlug = captured.modelSlug;
     const probe = {
       prompt: PROBE_PROMPT,
-      response: result.response,
-      classification: classifyProbeModel(result.response),
+      modelSlug,
+      modelSlugSource: modelSlug ? "conversation-response" : null,
+      modelSlugs: captured.modelSlugs,
+      classification: classifyProbeModel(result.response, {
+        networkModelSlug: modelSlug,
+        requireNetworkModelSlug: true,
+      }),
       temporary: result.temporary,
       answerTier: result.answerTier,
       url: result.url,
@@ -2778,6 +4119,7 @@ export class ChatGPTBrowser {
       cached: false,
       rateLimited: result.rateLimited,
       rateLimitScope: result.rateLimitScope,
+      pageRefreshedBeforeSend: refreshResult.refreshed,
     };
     if (probe.classification !== "unknown") {
       const checkedAt = Date.now();
@@ -2785,8 +4127,10 @@ export class ChatGPTBrowser {
       const continuousPageSession =
         session.browserRunning && session.chatgptPageOpen;
       const cachedProbe = {
-        response: probe.response,
+        modelSlug: probe.modelSlug,
+        modelSlugSource: probe.modelSlugSource,
         classification: probe.classification,
+        answerTier: probe.answerTier || null,
         policyKey: PROBE_POLICY_KEY,
         mode: mode || null,
         url: probe.url,
@@ -2817,24 +4161,35 @@ export class ChatGPTBrowser {
   async routeNewChat({
     prompt,
     files = [],
+    webSearch = false,
     requestPro = false,
     forceProbe = false,
     mode,
     wait = true,
     timeoutMs = RESPONSE_TIMEOUT_MS,
   }) {
+    if (requestPro) this.assertProbeEnabled();
     if (!requestPro) {
-      await this.newChat({ temporary: false, mode }, { includeStatus: false });
+      const newConversation = await this.newChat({ temporary: false, mode }, { includeStatus: false });
       const tier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
+      const refreshResult = await this.refreshBeforeSend({ reason: "route-new-chat" });
       if (files.length) await this.uploadFiles(files);
       await this.writePrompt(prompt);
-      const result = await this.submitPrompt({ wait, timeoutMs });
+      const search = webSearch ? await this.enableWebSearch() : { selected: false };
+      const result = await this.submitPrompt({ wait, timeoutMs, refresh: false });
       return {
         route: "default-extreme",
+        ...(newConversation.newChatRefresh
+          ? { newChatRefresh: newConversation.newChatRefresh }
+          : {}),
         probe: null,
         finalConversation: { tier: DEFAULT_ANSWER_TIER, temporary: false },
         tier,
-        result,
+        result: {
+          ...result,
+          webSearch: search,
+          pageRefreshedBeforeSend: refreshResult.refreshed,
+        },
       };
     }
 
@@ -2845,9 +4200,11 @@ export class ChatGPTBrowser {
       throw new ChatGPTWebError(
         "Pro 临时探针的回答不符合已配置的接受或回退规则；未创建正常对话。",
         {
-          probeResponse: probe.response,
+          modelSlug: probe.modelSlug,
+          modelSlugSource: probe.modelSlugSource,
           acceptedClassification: PROBE_ACCEPT_CLASSIFICATION,
           fallbackClassification: PROBE_FALLBACK_CLASSIFICATION,
+          networkAcceptedClassification: PROBE_NETWORK_ACCEPT_CLASSIFICATION,
           temporary: true,
         },
       );
@@ -2856,24 +4213,32 @@ export class ChatGPTBrowser {
     await this.newChat({ temporary: false, mode }, { includeStatus: false });
     let finalTier;
     let route;
+    const networkVerified = classification === PROBE_NETWORK_ACCEPT_CLASSIFICATION;
     if (classification === PROBE_ACCEPT_CLASSIFICATION) {
       finalTier = await this.selectAnswerTier(PRO_ANSWER_TIER);
       route = `verified-${classification}`;
+    } else if (networkVerified) {
+      finalTier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
+      route = `verified-${classification}-to-default`;
     } else {
       finalTier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
       route = `fallback-${classification}-to-default`;
     }
+    const refreshResult = await this.refreshBeforeSend({ reason: "route-new-chat" });
     if (files.length) await this.uploadFiles(files);
     await this.writePrompt(prompt);
+    const search = webSearch ? await this.enableWebSearch() : { selected: false };
     const result = await this.submitPrompt({
       wait,
       timeoutMs: classification === PROBE_ACCEPT_CLASSIFICATION ? null : timeoutMs,
+      refresh: false,
     });
     return {
       route,
       probe: {
         prompt: probe.prompt,
-        response: probe.response,
+        modelSlug: probe.modelSlug,
+        modelSlugSource: probe.modelSlugSource,
         classification,
         temporary: probe.temporary,
         cached: probe.cached,
@@ -2892,7 +4257,11 @@ export class ChatGPTBrowser {
         temporary: false,
       },
       tier: finalTier,
-      result,
+      result: {
+        ...result,
+        webSearch: search,
+        pageRefreshedBeforeSend: refreshResult.refreshed,
+      },
     };
   }
 
@@ -2966,39 +4335,43 @@ export class ChatGPTBrowser {
     }
     await this.siteAction("open-history-search");
     await this.click(resolvedButton, "open-history-search-click");
+    try {
+      const input = await this.firstVisible(SELECTORS.historySearchInputs, { timeout: 2_000 });
+      if (!input) throw new ChatGPTWebError("搜索聊天窗口已打开，但没有找到搜索输入框。");
+      await this.siteAction("search-history");
+      await this.fill(input, query, "fill-history-search");
+      await page.waitForTimeout(800);
 
-    const input = await this.firstVisible(SELECTORS.historySearchInputs, { timeout: 2_000 });
-    if (!input) throw new ChatGPTWebError("搜索聊天窗口已打开，但没有找到搜索输入框。");
-    await this.siteAction("search-history");
-    await this.fill(input, query, "fill-history-search");
-    await page.waitForTimeout(800);
-
-    const links = page.locator(
-      "[role='dialog'] a[href^='/c/'], [role='dialog'] [data-href^='/c/'], a[href^='/c/']:visible",
-    );
-    const raw = await links.evaluateAll((elements) =>
-      elements.map((element) => ({
-        href: element.getAttribute("href") || element.getAttribute("data-href") || "",
-        title:
-          (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim() ||
-          element.getAttribute("title") ||
-          element.getAttribute("aria-label") ||
-          "",
-      })),
-    );
-    const conversations = uniqueBy(
-      raw
-        .filter((item) => /^\/c\//.test(item.href))
-        .map((item) => ({
-          id: conversationIdFromUrl(item.href),
-          title: item.title,
-          url: absoluteChatUrl(item.href),
+      const links = page.locator(
+        "[role='dialog'] a[href^='/c/'], [role='dialog'] [data-href^='/c/'], a[href^='/c/']:visible",
+      );
+      const raw = await links.evaluateAll((elements) =>
+        elements.map((element) => ({
+          href: element.getAttribute("href") || element.getAttribute("data-href") || "",
+          title:
+            (element.innerText || element.textContent || "").replace(/\s+/g, " ").trim() ||
+            element.getAttribute("title") ||
+            element.getAttribute("aria-label") ||
+            "",
         })),
-      (item) => item.id,
-    ).slice(0, safeLimit);
+      );
+      const conversations = uniqueBy(
+        raw
+          .filter((item) => /^\/c\//.test(item.href))
+          .map((item) => ({
+            id: conversationIdFromUrl(item.href),
+            title: item.title,
+            url: absoluteChatUrl(item.href),
+          })),
+        (item) => item.id,
+      ).slice(0, safeLimit);
 
-    await this.keyboardPress(page, "Escape", "close-history-search").catch(() => {});
-    return { query, conversations, returned: conversations.length };
+      return { query, conversations, returned: conversations.length };
+    } finally {
+      // Also close the modal on selector/timeouts so later send/status calls
+      // cannot be blocked by a stale global-search dialog.
+      await this.keyboardPress(page, "Escape", "close-history-search").catch(() => {});
+    }
   }
 
   async selectHistory({ conversationId, url, title } = {}) {
@@ -3046,6 +4419,7 @@ export class ChatGPTBrowser {
       throw new ChatGPTWebError("请选择 conversationId、url 或 title 中的一项。");
     }
 
+    await this.assertComposerEmpty("select-history");
     await this.siteAction("select-history");
     await navigate(page, destination, { waitUntil: "domcontentloaded" }, this.signal());
     const composer = await this.composer();
@@ -3065,61 +4439,113 @@ export class ChatGPTBrowser {
     };
   }
 
-  async getLatestResponse({ includeSettings = false } = {}) {
+  async getLatestResponse({ includeSettings = false, includeTranscript = true } = {}) {
     const page = await this.page();
     const body = await page.locator("body").innerText().catch(() => "");
     const rateLimit = classifyRateLimitText(body);
+    const lengthLimit = classifyConversationLengthText(body);
     if (rateLimit.limited) await this.tripCircuitBreaker(rateLimit.scope, "page-text-read");
     const assistant = this.assistantLocator();
     const user = this.userLocator();
-    const count = await assistant.count();
-    const userCount = await user.count();
+    const renderedAssistantCount = await assistant.count();
+    const renderedUserCount = await user.count();
     const runtime = await readRuntimeState();
     const stop = await this.firstVisible(SELECTORS.stopButton, { timeout: 100 });
-    const lastAssistant = count ? assistant.last() : null;
+    const lastAssistant = renderedAssistantCount ? assistant.last() : null;
+    const lastAssistantText = lastAssistant
+      ? await lastAssistant.innerText().catch(() => "")
+      : "";
     const streaming = lastAssistant
       ? await lastAssistant
-          .locator("[data-is-streaming='true'], .result-streaming")
+          .locator(
+            "[data-is-streaming='true'], .result-streaming, [class*='loading-shimmer'], [data-testid*='thinking']",
+          )
           .count()
           .then((value) => value > 0)
           .catch(() => false)
       : false;
+    // A completed response can leave an empty assistant placeholder after
+    // streaming finishes. Preserve the PR's node-count/change completion rule.
     const generationComplete = Boolean(
       runtime.activeGeneration?.active &&
-        (runtime.activeGeneration.assistantBefore == null
-          ? count > 0
-          : count > Number(runtime.activeGeneration.assistantBefore)) &&
         !stop &&
-        !streaming,
+        !streaming &&
+        (runtime.activeGeneration.assistantBefore == null
+          ? renderedAssistantCount > 0
+          : renderedAssistantCount > Number(runtime.activeGeneration.assistantBefore) ||
+            lastAssistantText.trim() !==
+              String(runtime.activeGeneration.baselineResponse || "").trim()),
     );
-    if (generationComplete) {
+    const staleGeneration = generationIsStale(runtime);
+    if (generationComplete || staleGeneration) {
       await updateRuntimeState({
         activeGeneration: null,
-        lastGenerationCompletedAt: Date.now(),
+        ...(generationComplete
+          ? { lastGenerationCompletedAt: Date.now() }
+          : { lastGenerationInterruptedAt: Date.now() }),
       });
     }
-    const settings =
-      includeSettings &&
-      !runtime.circuitBreaker?.active &&
-      !(runtime.activeGeneration?.active && !generationComplete)
-        ? await this.advancedSettings()
-        : this.cachedSettings();
+    const generationUnconfirmed =
+      runtime.activeGeneration?.active && !generationComplete && !staleGeneration;
+    let settings = this.cachedSettings();
+    let settingsWarning = null;
+    if (includeSettings && !runtime.circuitBreaker?.active && !generationUnconfirmed) {
+      try {
+        settings = await this.advancedSettings();
+      } catch (error) {
+        settingsWarning = { message: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    const transcript = includeTranscript && !stop && !streaming &&
+      !rateLimit.limited && !runtime.circuitBreaker?.active && !generationUnconfirmed
+      ? await this.loadCompleteTranscript()
+      : null;
+    const userCount = transcript?.userMessageCount ?? renderedUserCount;
+    const assistantCount = transcript?.assistantMessageCount ?? renderedAssistantCount;
+    const latestUserText = transcript
+      ? transcript.messages.findLast((message) => message.author === "user")?.text.trim() || null
+      : renderedUserCount
+        ? (await user.last().innerText()).trim()
+        : null;
+    const latestAssistantText = transcript
+      ? transcript.messages.findLast((message) => message.author === "assistant")?.text.trim() || null
+      : renderedAssistantCount
+        ? lastAssistantText.trim()
+        : null;
+    const conversationState = conversationTurnLimitState(
+      {
+        userMessageCount: userCount,
+        assistantMessageCount: assistantCount,
+        lengthLimitDetected: lengthLimit.limited,
+      },
+      MAX_CONVERSATION_TURNS,
+    );
     return {
       url: page.url(),
       conversationId: conversationIdFromUrl(page.url()),
-      lastUserMessage: userCount ? (await user.last().innerText()).trim() : null,
+      lastUserMessage: latestUserText,
       userMessageCount: userCount,
-      response: count ? (await assistant.last().innerText()).trim() : null,
-      assistantMessageCount: count,
+      response: latestAssistantText,
+      assistantMessageCount: assistantCount,
       generating: Boolean(stop || streaming),
-      activeGeneration: generationComplete ? null : runtime.activeGeneration || null,
+      activeGeneration:
+        generationComplete || staleGeneration ? null : runtime.activeGeneration || null,
       rateLimited: rateLimit.limited,
       rateLimitScope: rateLimit.scope,
+      conversationTurnCount: conversationState.turnCount,
+      maxConversationTurns: MAX_CONVERSATION_TURNS,
+      conversationRotationRequired: conversationState.shouldRotate,
+      conversationLengthLimitDetected: lengthLimit.limited,
+      transcriptMessageCount: transcript?.messageCount ?? null,
+      transcriptLoaded: transcript?.complete ?? false,
+      transcriptLoadPasses: transcript?.passes ?? 0,
+      transcriptSource: transcript?.source || null,
       circuitBreaker: rateLimit.limited
         ? (await readRuntimeState()).circuitBreaker || null
         : runtime.circuitBreaker || null,
       model: settings.model,
       thinkingLevel: settings.thinkingLevel,
+      settingsWarning,
       mode: await this.currentMode(),
       temporary: await this.temporaryState(),
     };

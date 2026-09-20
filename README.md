@@ -2,7 +2,7 @@
 
 [English](README.en.md)
 
-一个本地、非官方的 MCP Server，让 Codex 等 MCP 客户端通过独立的持久浏览器配置操作 `chatgpt.com`。它不调用 ChatGPT API，不读取用户日常浏览器配置，也不会把登录信息写进 MCP 配置。
+一个本地、非官方的 MCP Server，让 Codex 等 MCP 客户端通过独立的持久浏览器配置操作 `chatgpt.com`。它不使用 OpenAI 官方付费 API，也不需要 API Key。消息发送通过网页完成；历史读取可能使用当前网页会话的内部接口。它不读取用户日常浏览器配置，也不会把登录信息写进 MCP 配置。
 
 > [!IMPORTANT]
 > 本项目与 OpenAI 无隶属或背书关系。它依赖 ChatGPT 网页界面，页面改版、账号权限、地区或工作区策略都可能影响可用性。请遵守适用于你账号的条款，不要用它绕过访问控制、用量限制或安全机制。
@@ -12,10 +12,11 @@
 - 写入提示词、上传文件、发送消息并读取完整回答
 - 新建普通或临时对话，选择历史对话
 - 动态读取和选择页面实际显示的模型、思考强度与能力档位
-- 使用可配置的临时身份探针决定是否在正常对话继续使用 Pro，并在同一页面会话内持续复用可靠结果
+- 普通请求默认使用“极高”；临时 Pro 身份探针默认停用，避免额外创建临时对话和发送测试消息
 - 浏览器和 ChatGPT 页面默认常驻，工具结束后只断开本地控制连接
 - 跨进程串行操作、低频节流、回答完成后的切换静默期
-- 遇到页面限流文字或 HTTP 429 时立即熔断，不自动关闭提示或重试
+- 遇到页面限流文字或非历史接口 HTTP 429 时熔断；历史接口 429 不触发全局熔断，不自动重试该接口
+- 对话达到 40 轮或出现 ChatGPT maximum-length banner 时，发送前先滚动加载完整 transcript（含较早历史），再归档并轮换普通对话；直接 `chatgpt_submit_prompt` 会安全拦截
 - 只记录脱敏后的异常请求方法、路径、状态码和资源类型
 
 ## 运行要求
@@ -91,7 +92,7 @@ chatgpt-web-mcp help     显示帮助
 - 状态：`chatgpt_status`、`chatgpt_capabilities`、`chatgpt_browser_lifecycle`
 - 对话：`chatgpt_new_chat`、`chatgpt_set_temporary`、`chatgpt_list_history`、`chatgpt_search_history`、`chatgpt_select_history`
 - 设置：`chatgpt_list_modes`、`chatgpt_select_mode`、`chatgpt_list_models`、`chatgpt_select_model`、`chatgpt_list_thinking_levels`、`chatgpt_select_thinking_level`、`chatgpt_answer_tier_status`、`chatgpt_select_answer_tier`
-- 输入与输出：`chatgpt_write_prompt`、`chatgpt_upload_files`、`chatgpt_submit_prompt`、`chatgpt_send_message`、`chatgpt_get_latest_response`
+- 输入与输出：`chatgpt_write_prompt`、`chatgpt_upload_files`、`chatgpt_submit_prompt`、`chatgpt_send_message`、`chatgpt_get_latest_response`、`chatgpt_archive_conversation`
 - 安全：`chatgpt_circuit_breaker_status`、`chatgpt_clear_circuit_breaker`、`chatgpt_network_diagnostics`
 - 策略路由：`chatgpt_probe_pro_identity`、`chatgpt_route_new_chat`
 
@@ -99,21 +100,19 @@ chatgpt-web-mcp help     显示帮助
 
 ## 默认路由策略
 
-普通请求默认新建非临时对话并选择“极高”。明确请求 Pro 时：
+普通请求默认新建非临时对话并选择页面可用的“极高”档位，使用 `chatgpt_route_new_chat(requestPro=false)`。
 
-1. 优先复用同模式下仍有效的身份探针缓存；只要专用浏览器和原 ChatGPT 页面没有关闭，就不按时间重复探针。
-2. 没有缓存时，新建临时对话并选择 Pro。
-3. 发送“你是什么模型？”，无限等待回答完成。
-4. 回答匹配 GPT-5.6 Pro 时，新建正常 Pro 对话。
-5. 回答匹配 GPT-5.5 mini 时，新建正常“极高”对话。
-6. 其他回答停止，不创建正常对话。
+**临时 Pro 身份探针默认停用**（`CHATGPT_WEB_PROBE_ENABLED=false`）。`chatgpt_probe_pro_identity` 或 `requestPro=true` 会明确报错，不新建临时对话，也不发送“你是什么模型？”；`forceProbe=true` 不能绕过停用设置。这样可以避免探针产生额外对话和请求。停用探针不等于禁止手动选择页面实际提供的 Pro 档位，但本工具不保证账号实际路由到哪一个模型。
 
-如果专用浏览器或原 ChatGPT 页面中途关闭，已有可靠结果会先继续复用 3 小时；3 小时后发起下一次 Pro 请求时才重新验证。普通 MCP 调用结束只断开本地控制连接，不关闭页面，因此不会触发重新验证计时。无法确定手动关闭的准确时刻时，从首次检测到会话中断开始计算，以减少额外请求。
+仅在确实需要实验性身份核对时，才手动设置 `CHATGPT_WEB_PROBE_ENABLED=true` 并重启 MCP。当前实验流程在临时对话的可用档位发送探针，读取网络响应的 `model_slug`：mini 回退默认档位，其他非空标记记为 `network-verified`，缺少标记则停止。**非 mini 不等于 Pro**，该流程不会强制选择 Pro。工具名及 `requestPro` 参数为兼容旧客户端而保留，不能把它们理解为 Pro 保证。
 
-以上是默认值，不是写死的账号假设。可通过环境变量替换：
+启用探针时，同一浏览器与页面会话持续复用可靠缓存；检测到关闭后保留 3 小时，再次请求时才重验。普通 MCP 调用结束只断开控制连接，不关闭网页，不启动重验计时。默认停用状态下不会因缓存过期自动发起探针，也不会要求重新登录。
+
+相关配置：
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
+| `CHATGPT_WEB_PROBE_ENABLED` | `false` | 是否显式启用实验性临时身份探针 |
 | `CHATGPT_WEB_DEFAULT_TIER` | `极高` | 普通请求和回退使用的倒数第二档名称 |
 | `CHATGPT_WEB_PRO_TIER` | `Pro` | 滑杆最高档名称 |
 | `CHATGPT_WEB_PROBE_PROMPT` | `你是什么模型？` | 临时身份探针提示词 |
@@ -125,21 +124,32 @@ chatgpt-web-mcp help     显示帮助
 
 参考配置见 [.env.example](.env.example)。项目不会自动读取 `.env`；请通过 MCP 客户端、Shell 或系统环境注入变量。
 
+## 新对话前的可选刷新
+
+`CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT=false`，默认不额外刷新旧页面。设置为 `true` 并重启 MCP 后，新建对话执行“检查草稿和附件 → 刷新当前页面 → 站内新建”。刷新失败或出现限流时停止，不重试。
+
+这与现有的“发送前刷新”是两个步骤。开启后，一次新建并发送通常会刷新两次，增加请求量和耗时；它用于按需处理旧页面状态，不是防限流功能。已完成的小规模测试只能说明该流程可用，不能证明额外刷新能降低限流。浏览器与网页仍默认常驻。
+
 ## 安全节流
 
 | 环境变量 | 默认值 |
 | --- | ---: |
 | `CHATGPT_WEB_PAGE_INTERACTION_INTERVAL_MS` | 1000 ms |
 | `CHATGPT_WEB_SITE_ACTION_INTERVAL_MS` | 5000 ms |
-| `CHATGPT_WEB_SEND_INTERVAL_MS` | 30000 ms |
-| `CHATGPT_WEB_CONVERSATION_CHANGE_INTERVAL_MS` | 30000 ms |
-| `CHATGPT_WEB_POST_RESPONSE_CONVERSATION_COOLDOWN_MS` | 30000 ms |
+| `CHATGPT_WEB_SEND_INTERVAL_MS` | 5000 ms |
+| `CHATGPT_WEB_CONVERSATION_CHANGE_INTERVAL_MS` | 5000 ms |
+| `CHATGPT_WEB_POST_RESPONSE_CONVERSATION_COOLDOWN_MS` | 5000 ms |
+| `CHATGPT_WEB_PAGE_STARTUP_DELAY_MS` | 6000 ms |
 | `CHATGPT_WEB_POST_BREAKER_COOLDOWN_MS` | 300000 ms |
 | `CHATGPT_WEB_HISTORY_QUIET_PERIOD_MS` | 300000 ms |
 
-新建、临时切换和历史选择受独立的对话变更间隔约束。回答完成后至少静默 30 秒才允许切换；人工清除熔断后，首次站点操作默认再等待 5 分钟。历史记录限流还有独立的静默截止时间，清除熔断不会绕过它。
+**默认 5 秒是最小间隔，不是每 5 秒必定完成一次操作，也不是免于限流或封禁的保证。** 页面加载、页面交互、生成回答以及其他等待会叠加；完成上一条回答后才开始下一条，不并发发送。已有客户端环境变量会覆盖新默认值；例如原先显式配置了 `30000`，升级后仍使用 30 秒。
 
-不要为了“更快”而在公开分支中降低这些默认值。
+新建、临时切换和历史选择受独立的 5 秒对话变更间隔约束，回答完成后至少静默 5 秒才允许切换。首次打开 ChatGPT 页面后仍等待 6 秒。若账号出现请求频繁提示，应停止并增大间隔，例如把上述三个 `5000` 配置改回 `30000`，不要反复重试。
+
+人工确认限流消失并清除本地熔断后，首次站点操作仍等待 5 分钟；页面明确提示历史限流时还有独立的 5 分钟静默截止时间，清除熔断不会绕过它。仅历史接口返回 HTTP 429 不触发全局熔断：浏览器响应保留诊断日志，主动读取失败则沿用页面 transcript 回退，不自动重试该接口。网页明确出现“请求过于频繁”等限流提示时仍停止。缺少现成请求头时不再额外打开页面取认证信息。
+
+保留 PR 的旧进程锁回收逻辑：记录的 MCP 进程已退出时，后续操作会自动清除其生成标记，避免遗留锁阻塞。进程仍存活或标记未记录进程 ID 时，不按此规则清除；这不会同时清除限流熔断，也不会关闭浏览器。
 
 ## 其他环境变量
 
@@ -154,6 +164,8 @@ chatgpt-web-mcp help     显示帮助
 - `CHATGPT_WEB_BROWSER_STATE`、`CHATGPT_WEB_RUNTIME_STATE`：本地状态文件
 - `CHATGPT_WEB_OPERATION_LOCK`：跨进程浏览器独占锁
 - `CHATGPT_WEB_NETWORK_LOG`：脱敏网络异常日志
+- `CHATGPT_WEB_MAX_CONVERSATION_TURNS`：发送前自动轮换阈值，默认 `40`
+- `CHATGPT_WEB_CONTEXT_ARCHIVE_DIR`：对话轮换前 Markdown 归档目录
 
 ## 隐私与局限
 
@@ -161,9 +173,10 @@ chatgpt-web-mcp help     显示帮助
 - 文件上传只接受调用者明确提供的绝对路径。
 - 网络诊断不保存查询参数、Cookie、请求体、响应体或对话 ID。
 - 等待回答使用页面内的变更事件，不持续轮询页面。
-- 页面操作失败时会停止，不通过整页重载反复尝试。
+- 每次发送前只做一次当前对话整页刷新并重新校验；页面、对话 URL、用户草稿或附件状态异常时停止，不自动重试。
+- 对话轮换前的完整 transcript（含懒加载的较早消息）由 `chatgpt_archive_conversation` 或原子发送路径以 `0600` Markdown 文件保存；归档目录应按部署需要纳入受控的研究文档路径。
 - ChatGPT 网页不是稳定 API；选择器可能随页面更新而需要维护。
-- 模型的自我说明只能作为路由信号，不等同于服务端可验证的模型证明。
+- 模型自我说明和网络模型标记都不构成对实际服务模型的独立证明；尤其不能把“非 mini”当作 Pro 保证。
 
 ## 开发
 

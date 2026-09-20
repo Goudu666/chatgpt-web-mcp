@@ -85,6 +85,19 @@ export const RECONNECT_DELAY_MS = Number(
   process.env.CHATGPT_WEB_RECONNECT_DELAY_MS || 5_000,
 );
 
+export const PAGE_STARTUP_DELAY_MS = Number(
+  process.env.CHATGPT_WEB_PAGE_STARTUP_DELAY_MS || 6_000,
+);
+
+// A second refresh is opt-in; the send path already refreshes its page.
+export const REFRESH_BEFORE_NEW_CHAT = /^(1|true|yes)$/i.test(
+  process.env.CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT || "false",
+);
+
+export const PROBE_ENABLED = /^(1|true|yes|on)$/i.test(
+  String(process.env.CHATGPT_WEB_PROBE_ENABLED || "false").trim(),
+);
+
 export const SITE_ACTION_INTERVAL_MS = Number(
   process.env.CHATGPT_WEB_SITE_ACTION_INTERVAL_MS || 5_000,
 );
@@ -94,15 +107,15 @@ export const PAGE_INTERACTION_INTERVAL_MS = Number(
 );
 
 export const SEND_INTERVAL_MS = Number(
-  process.env.CHATGPT_WEB_SEND_INTERVAL_MS || 30_000,
+  process.env.CHATGPT_WEB_SEND_INTERVAL_MS || 5_000,
 );
 
 export const CONVERSATION_CHANGE_INTERVAL_MS = Number(
-  process.env.CHATGPT_WEB_CONVERSATION_CHANGE_INTERVAL_MS || 30_000,
+  process.env.CHATGPT_WEB_CONVERSATION_CHANGE_INTERVAL_MS || 5_000,
 );
 
 export const POST_RESPONSE_CONVERSATION_COOLDOWN_MS = Number(
-  process.env.CHATGPT_WEB_POST_RESPONSE_CONVERSATION_COOLDOWN_MS || 30_000,
+  process.env.CHATGPT_WEB_POST_RESPONSE_CONVERSATION_COOLDOWN_MS || 5_000,
 );
 
 export const POST_BREAKER_COOLDOWN_MS = Number(
@@ -136,6 +149,9 @@ export const PROBE_ACCEPT_CLASSIFICATION =
 export const PROBE_FALLBACK_CLASSIFICATION =
   process.env.CHATGPT_WEB_PROBE_FALLBACK_ID || "gpt-5.5-mini";
 
+export const PROBE_NETWORK_ACCEPT_CLASSIFICATION =
+  process.env.CHATGPT_WEB_PROBE_NETWORK_ACCEPT_ID || "network-verified";
+
 export const PROBE_ACCEPT_PATTERN =
   process.env.CHATGPT_WEB_PROBE_ACCEPT_PATTERN ||
   "gpt\\s*[- ]?5[.．]6\\s*[- ]?pro|5[.．]6\\s*[- ]?pro";
@@ -149,6 +165,7 @@ export const PROBE_POLICY_KEY = [
   PROBE_PROMPT,
   PROBE_ACCEPT_CLASSIFICATION,
   PROBE_FALLBACK_CLASSIFICATION,
+  PROBE_NETWORK_ACCEPT_CLASSIFICATION,
   PROBE_ACCEPT_PATTERN,
   PROBE_FALLBACK_PATTERN,
 ].join("\n");
@@ -173,6 +190,21 @@ export const OPERATION_LOCK_FILE = path.resolve(
 export const NETWORK_LOG_FILE = path.resolve(
   process.env.CHATGPT_WEB_NETWORK_LOG ||
     path.join(os.homedir(), ".chatgpt-web-mcp", "network-diagnostics.jsonl"),
+);
+
+// ChatGPT currently caps the useful length of a single conversation.  Keep a
+// conservative limit below the server-side hard failure so tool-managed sends
+// rotate before the page displays “You've reached the maximum length ...”.
+export const MAX_CONVERSATION_TURNS = Number(
+  process.env.CHATGPT_WEB_MAX_CONVERSATION_TURNS || 40,
+);
+
+// Rotation archives are explicit user-requested persistence: the MCP keeps a
+// Markdown transcript before opening the next conversation.  Deployments may
+// point this at a checked-out research repository's docs directory.
+export const CONTEXT_ARCHIVE_DIR = path.resolve(
+  process.env.CHATGPT_WEB_CONTEXT_ARCHIVE_DIR ||
+    path.join(os.homedir(), ".chatgpt-web-mcp", "conversation-context"),
 );
 
 export const MAX_HISTORY_RESULTS = 50;

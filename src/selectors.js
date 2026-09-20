@@ -16,6 +16,7 @@ export const SELECTORS = {
   ],
   stopButton: [
     "button[data-testid='stop-button']",
+    "button[aria-label='Stop answering']",
     "button[aria-label='Stop generating']",
     "button[aria-label='Stop streaming']",
     "button[aria-label='Stop response']",
@@ -25,11 +26,18 @@ export const SELECTORS = {
   ],
   assistantMessages: [
     "[data-message-author-role='assistant']",
-    "article[data-turn='assistant']",
+    // New ChatGPT layouts render a section wrapper around the role node.
+    // Select the wrapper only when the role node is absent, otherwise one
+    // message would be counted twice.  Thinking/reasoning wrappers are not
+    // assistant answers; including them makes a completed answer look like
+    // an active generation forever when the shimmer node is left in the DOM.
+    "article[data-turn='assistant']:not(:has([data-message-author-role='assistant']))",
+    "section[data-turn='assistant']:not(:has([data-message-author-role='assistant']))",
   ],
   userMessages: [
     "[data-message-author-role='user']",
-    "article[data-turn='user']",
+    "article[data-turn='user']:not(:has([data-message-author-role='user']))",
+    "section[data-turn='user']:not(:has([data-message-author-role='user']))",
   ],
   fileInput: [
     "input[type='file']",
@@ -41,6 +49,10 @@ export const SELECTORS = {
     "button[aria-label*='添加']",
     "button[aria-label*='上传']",
   ],
+  webSearchHints: [
+    "[data-inline-selection-pill][data-id='search']",
+    "[data-system-hint-type='search']",
+  ],
   uploadMenuItems: [
     "[role='menuitem']:has-text('Add photos & files')",
     "[role='menuitem']:has-text('Upload from computer')",
@@ -48,6 +60,13 @@ export const SELECTORS = {
     "[role='menuitem']:has-text('上传文件')",
     "button:has-text('Add photos & files')",
     "button:has-text('添加照片和文件')",
+  ],
+  unarchiveButtons: [
+    "button[data-testid='unarchive-button']",
+    "button[aria-label='Unarchive']",
+    "button[aria-label='取消归档']",
+    "button:has-text('Unarchive')",
+    "button:has-text('取消归档')",
   ],
   modelButtons: [
     "button[data-testid='model-switcher-dropdown-button']",
