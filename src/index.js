@@ -7,25 +7,30 @@ import { z } from "zod";
 import { ChatGPTBrowser } from "./browser.js";
 import {
   DEFAULT_ANSWER_TIER,
+  CONVERSATION_CHANGE_INTERVAL_MS,
   CONTEXT_ARCHIVE_DIR,
   MAX_CONVERSATION_TURNS,
-  PROBE_ACCEPT_CLASSIFICATION,
-  PROBE_FALLBACK_CLASSIFICATION,
-  PROBE_NETWORK_ACCEPT_CLASSIFICATION,
+  PROBE_ENABLED,
   PROBE_PROMPT,
   PRO_ANSWER_TIER,
   PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
+  POST_RESPONSE_CONVERSATION_COOLDOWN_MS,
+  REFRESH_BEFORE_NEW_CHAT,
   RESPONSE_TIMEOUT_MS,
+  SEND_INTERVAL_MS,
 } from "./config.js";
 import { userFacingError } from "./errors.js";
 
 const browser = new ChatGPTBrowser();
+const probeInstructions = PROBE_ENABLED
+  ? `实验性网络身份探针已显式启用：仅在用户要求身份核对时使用，非 mini 的 model_slug 不等于已经验证为 Pro。探针不会强制选择 Pro 档位。同一页面会话复用缓存，关闭后保留 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时；forceProbe 仅用于用户明确要求重新验证。`
+  : "临时 Pro 身份探针默认停用。不得调用 chatgpt_probe_pro_identity，也不得用 requestPro=true 调用 chatgpt_route_new_chat；这些调用会在新建临时对话或发送测试消息前停止。普通极高路由使用 requestPro=false。";
 const server = new McpServer({
   name: "chatgpt-web",
   version: "0.2.1",
 }, {
   instructions:
-    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。每次发送消息前必须刷新当前 ChatGPT 对话页面，并重新校验当前 URL、用户草稿和页面状态；原子发送路径必须在上传文件和写入提示词之前刷新，直接提交已有草稿时会安全恢复草稿，检测到变化则拒绝发送。对话达到 ${MAX_CONVERSATION_TURNS} 个用户/回答轮次或页面出现“maximum length”错误时，原子发送会先加载完整 transcript（包括滚动触发的较早历史）并归档到 ${CONTEXT_ARCHIVE_DIR}，再自动新建普通对话；直接 submit_prompt 则拦截并返回轮换要求。新任务优先用 chatgpt_route_new_chat：普通请求使用当前可用档位“${DEFAULT_ANSWER_TIER}”；需要模型身份确认时发送网络身份探针，不选择或依赖当前不可用的 Pro 档位。身份以已完成的 /backend-api/f/conversation 响应中的 model_slug 为唯一权威：规范化后精确为 gpt-5-5-mini 才回退，任何其他非空 slug（例如 gpt-5-6-thinking）分类为“${PROBE_NETWORK_ACCEPT_CLASSIFICATION}”；页面自报文本不保留、不参与校验。页面或浏览器关闭后保留可靠结果 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。只有用户明确要求重新验证时才设置 forceProbe。`,
+    `默认保持专用浏览器和 ChatGPT 页面常驻，除非用户明确要求，否则绝不调用 chatgpt_close_browser。发送最小间隔 ${SEND_INTERVAL_MS / 1_000} 秒，对话变更最小间隔 ${CONVERSATION_CHANGE_INTERVAL_MS / 1_000} 秒，回答完成后再等 ${POST_RESPONSE_CONVERSATION_COOLDOWN_MS / 1_000} 秒才切换；这些是下限，不保证免于限流。新建前的额外刷新当前${REFRESH_BEFORE_NEW_CHAT ? "开启" : "关闭"}，由 CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT 控制。每次发送前仍刷新当前对话，并校验 URL、草稿和附件；检测到变化则停止。对话达到 ${MAX_CONVERSATION_TURNS} 轮或出现 maximum-length 错误时，原子发送会先读取完整 transcript 并归档到 ${CONTEXT_ARCHIVE_DIR}，再新建普通对话；直接 submit_prompt 则拦截。新任务优先用 chatgpt_route_new_chat，普通请求使用页面可用档位“${DEFAULT_ANSWER_TIER}”。${probeInstructions}`,
 });
 
 function asResult(value, isError = false) {
@@ -165,7 +170,7 @@ tool(
 
 tool(
   "chatgpt_new_chat",
-  "创建新的普通或临时对话，并可同时选择模式、模型、思考强度和能力档位。",
+  "创建新的普通或临时对话，并可选择模式、模型、思考强度和能力档位。新建前额外刷新由 CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT 控制，默认关闭；刷新失败或有草稿/附件时停止。",
   {
     temporary: z.boolean().default(false).describe("true 表示临时对话，不进入历史记录。"),
     mode: z.string().min(1).optional().describe("可选模式，例如“聊天”或“工作”。"),
@@ -243,7 +248,9 @@ tool(
 
 tool(
   "chatgpt_probe_pro_identity",
-  `执行网络模型身份探针（工具名保留旧名称以兼容调用）：同一浏览器和 ChatGPT 页面会话内始终复用可靠结果；页面或浏览器关闭后继续复用 ${Math.round(PRO_PROBE_RECHECK_AFTER_CLOSE_MS / 3_600_000)} 小时，之后才重新验证。没有可用缓存时才新建临时对话，在当前可用能力档位发送“${PROBE_PROMPT}”并无限等待，不选择或依赖 Pro。返回 modelSlug、modelSlugSource 和分类，不保留页面自报文本；已完成 /backend-api/f/conversation 响应中的 model_slug 是唯一权威，gpt-5-5-mini 回退，其他非空 slug（例如 gpt-5-6-thinking）通过网络身份校验；缺少 model_slug 为 unknown。不创建正常对话。`,
+  PROBE_ENABLED
+    ? `执行已显式启用的实验性网络身份探针（兼容旧工具名）。临时对话使用当前档位发送“${PROBE_PROMPT}”；网络 model_slug 非 mini 不等于 Pro 身份证明。不自动选择 Pro，不创建正常对话。${probeInstructions}`
+    : "临时 Pro 身份探针当前停用；调用将明确停止，不打开临时对话，也不发送消息。",
   {
     mode: z.string().min(1).optional(),
     force: z.boolean().default(false).describe("true 表示忽略缓存并重新执行探针；仅在用户明确要求时使用。"),
@@ -253,12 +260,12 @@ tool(
 
 tool(
   "chatgpt_route_new_chat",
-  `按可配置策略新建并发送：普通请求使用当前可用档位“${DEFAULT_ANSWER_TIER}”；需要身份确认时先执行网络模型身份探针，不选择或依赖 Pro。网络 model_slug 命中 gpt-5-5-mini 则回退默认档位；其他非空 slug（分类“${PROBE_NETWORK_ACCEPT_CLASSIFICATION}”）通过身份校验并使用默认可用档位；缺少或未知身份停止。浏览器始终常驻。`,
+  `普通请求新建非临时对话并使用页面可用档位“${DEFAULT_ANSWER_TIER}”。${probeInstructions} 浏览器始终常驻。`,
   {
     prompt: z.string().min(1).describe("最终正常对话要发送的实际提示词。"),
     files: z.array(z.string().min(1)).default([]),
     webSearch: z.boolean().default(false).describe("发送前启用并校验 ChatGPT 网页原生网页搜索。"),
-    requestPro: z.boolean().default(false).describe("用户是否明确要求 Pro。"),
+    requestPro: z.boolean().default(false).describe("兼容旧参数：true 请求实验性身份探针，并不保证选择 Pro；探针默认停用，此时 true 会在新建临时对话或发送探针前拒绝。"),
     forceProbe: z.boolean().default(false).describe("是否忽略会话级 Pro 探针缓存；仅在用户明确要求时设为 true。"),
     mode: z.string().min(1).optional(),
     wait: z.boolean().default(true),

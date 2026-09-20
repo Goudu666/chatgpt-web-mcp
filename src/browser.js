@@ -21,10 +21,12 @@ import {
   NETWORK_LOG_FILE,
   OPERATION_LOCK_FILE,
   PAGE_INTERACTION_INTERVAL_MS,
+  PAGE_STARTUP_DELAY_MS,
   POST_BREAKER_COOLDOWN_MS,
   POST_RESPONSE_CONVERSATION_COOLDOWN_MS,
   PROBE_ACCEPT_CLASSIFICATION,
   PROBE_ACCEPT_PATTERN,
+  PROBE_ENABLED,
   PROBE_FALLBACK_CLASSIFICATION,
   PROBE_FALLBACK_PATTERN,
   PROBE_NETWORK_ACCEPT_CLASSIFICATION,
@@ -33,6 +35,7 @@ import {
   PRO_ANSWER_TIER,
   PRO_PROBE_RECHECK_AFTER_CLOSE_MS,
   RECONNECT_DELAY_MS,
+  REFRESH_BEFORE_NEW_CHAT,
   RESPONSE_TIMEOUT_MS,
   RUNTIME_LOCK_FILE,
   RUNTIME_STATE_FILE,
@@ -231,6 +234,7 @@ export function networkRateLimitScope(pathname) {
 }
 
 const CONVERSATION_CHANGE_ACTIONS = new Set([
+  "refresh-before-new-chat",
   "new-chat",
   "enable-temporary-chat",
   "disable-temporary-chat",
@@ -238,6 +242,8 @@ const CONVERSATION_CHANGE_ACTIONS = new Set([
 ]);
 
 const HISTORY_QUIET_ACTIONS = new Set([
+  "refresh-before-new-chat",
+  "read-history-api",
   "new-chat",
   "disable-temporary-chat",
   "open-history-sidebar",
@@ -1252,6 +1258,9 @@ export class ChatGPTBrowser {
       this.appendNetworkDiagnostic(entry).catch(() => {});
       if (status === 429) {
         const scope = networkRateLimitScope(diagnosticPath);
+        // History failures are diagnostic-only; page-visible rate-limit
+        // warnings still stop operations through the existing text checks.
+        if (scope === "history") return;
         this.tripCircuitBreaker(scope, `network-response:${diagnosticPath}`).catch(() => {});
         page
           .evaluate(
@@ -1282,6 +1291,7 @@ export class ChatGPTBrowser {
       );
     }
 
+    let openedChatGPTPage = false;
     try {
       const prior = await readBrowserState();
       const priorEndpoint = await chromeEndpoint(Number(prior?.port));
@@ -1319,6 +1329,7 @@ export class ChatGPTBrowser {
           stdio: ["ignore", "ignore", "ignore"],
         });
         this.#chromeProcess.unref();
+        openedChatGPTPage = true;
 
         const endpoint = await waitForChromeEndpoint(port, this.#chromeProcess, stderrLines);
         this.#browser = await chromium.connectOverCDP(endpoint);
@@ -1375,6 +1386,12 @@ export class ChatGPTBrowser {
         { waitUntil: "domcontentloaded" },
         this.signal(),
       );
+      openedChatGPTPage = true;
+    }
+
+    if (openedChatGPTPage && PAGE_STARTUP_DELAY_MS > 0) {
+      await this.#page.waitForLoadState("domcontentloaded", { timeout: ACTION_TIMEOUT_MS });
+      await waitWithAbort(PAGE_STARTUP_DELAY_MS, this.signal());
     }
 
     return this.#page;
@@ -1388,6 +1405,9 @@ export class ChatGPTBrowser {
       persistent: true,
       browserRunning,
       reconnectDelayMs: RECONNECT_DELAY_MS,
+      pageStartupDelayMs: PAGE_STARTUP_DELAY_MS,
+      proProbeEnabled: PROBE_ENABLED,
+      refreshBeforeNewChat: REFRESH_BEFORE_NEW_CHAT,
       siteActionIntervalMs: SITE_ACTION_INTERVAL_MS,
       pageInteractionIntervalMs: PAGE_INTERACTION_INTERVAL_MS,
       sendIntervalMs: SEND_INTERVAL_MS,
@@ -1953,19 +1973,47 @@ export class ChatGPTBrowser {
     };
   }
 
+  async refreshBeforeNewChat() {
+    const page = await this.page();
+    await this.ensureSignedIn();
+    await this.assertComposerEmpty("refresh-before-new-chat");
+    const pendingFiles = await page
+      .locator(SELECTORS.fileInput.join(", "))
+      .evaluateAll((inputs) =>
+        inputs.reduce((count, input) => count + Number(input.files?.length || 0), 0),
+      );
+    if (pendingFiles > 0) {
+      throw new ChatGPTWebError("当前有未发送的附件，已拒绝刷新并新建对话。", { pendingFiles });
+    }
+    await this.siteAction("refresh-before-new-chat");
+    await this.pageInteraction("refresh-before-new-chat-reload");
+    const beforeUrl = page.url();
+    const startedAt = Date.now();
+    await page.reload({ waitUntil: "domcontentloaded" });
+    this.#signedInUntil = 0;
+    await this.ensureSignedIn();
+    await this.throwIfRateLimited();
+    return { refreshed: true, beforeUrl, afterUrl: page.url(), startedAt, completedAt: Date.now() };
+  }
+
   async newChat(
     { temporary = false, model, mode, thinkingLevel, answerTier } = {},
-    { includeStatus = true } = {},
+    { includeStatus = true, refreshBeforeNewChat = REFRESH_BEFORE_NEW_CHAT } = {},
   ) {
+    const refreshResult = refreshBeforeNewChat ? await this.refreshBeforeNewChat() : null;
     const root = await this.openRoot({ temporary });
     if (mode) await this.selectMode(mode);
     if (model) await this.selectModel(model);
     if (thinkingLevel) await this.selectThinkingLevel(thinkingLevel);
     if (answerTier) await this.selectAnswerTier(answerTier);
     if (temporary && !root.temporary) await this.setTemporary(true, { includeStatus: false });
-    if (includeStatus) return this.status();
+    if (includeStatus) {
+      const status = await this.status();
+      return refreshResult ? { ...status, newChatRefresh: refreshResult } : status;
+    }
     return {
       ...root,
+      ...(refreshResult ? { newChatRefresh: refreshResult } : {}),
       configured: {
         mode: mode || null,
         model: model || null,
@@ -3267,21 +3315,12 @@ export class ChatGPTBrowser {
     }
     const conversationId = conversationIdFromUrl(currentUrl);
     if (!conversationId) return { available: false, messages: [], error: "no-conversation-id" };
-    const primeApiHeaders = async () => {
-      const primePage = await this.#context.newPage().catch(() => null);
-      if (primePage) {
-        this.attachNetworkDiagnostics(primePage);
-        await primePage
-          .goto(`${CHATGPT_URL.replace(/\/$/u, "")}/c/${conversationId}?mcp_api_prime=${Date.now()}`, {
-            waitUntil: "domcontentloaded",
-            timeout: ACTION_TIMEOUT_MS,
-          })
-          .catch(() => {});
-        await primePage.waitForTimeout(1_000).catch(() => {});
-        await primePage.close().catch(() => {});
-      }
-    };
-    if (!this.#apiHeaders.authorization) await primeApiHeaders();
+    // Only reuse headers already observed from the user's current page.
+    // Do not open an extra conversation page just to prime an API request.
+    if (!this.#apiHeaders.authorization) {
+      return { available: false, messages: [], error: "api-headers-unavailable" };
+    }
+    await this.siteAction("read-history-api");
     const cookieHeader = (await this.#context.cookies("https://chatgpt.com").catch(() => []))
       .map((cookie) => `${cookie.name}=${cookie.value}`)
       .join("; ");
@@ -3297,12 +3336,7 @@ export class ChatGPTBrowser {
           "x-openai-target-route": "/backend-api/conversations/{conversation_id}",
         },
       }).catch((error) => ({ ok: false, status: 0, error: String(error?.message || error) }));
-    let response = await requestApi();
-    if ((response.status === 401 || response.status === 403) && this.#apiHeaders.authorization) {
-      this.#apiHeaders = {};
-      await primeApiHeaders();
-      response = await requestApi();
-    }
+    const response = await requestApi();
     const responseBody = response.ok ? await response.json().catch(() => null) : null;
     if (!response.ok || !responseBody) {
       return {
@@ -3654,7 +3688,7 @@ export class ChatGPTBrowser {
     await this.siteAction("send-prompt");
     const send = await this.firstVisible(SELECTORS.sendButton, { timeout: 1_000 });
     if (send && (await send.isEnabled().catch(() => true))) {
-      await this.click(send, "send-prompt-click");
+      await this.domClick(send, "send-prompt-click");
     } else {
       await this.press(composer, "Enter", "send-prompt-enter");
     }
@@ -3758,8 +3792,8 @@ export class ChatGPTBrowser {
         // A client-side timeout must not leave a completed/non-generating page
         // permanently locked. Keep the lock only while the page still shows
         // an active generation; getLatestResponse can then clear it once the
-        // final text is observable.
-        const latest = await this.getLatestResponse().catch(() => null);
+        // final text is observable. This check does not fetch history.
+        const latest = await this.getLatestResponse({ includeTranscript: false }).catch(() => null);
         if (latest && !latest.generating) {
           await updateRuntimeState({
             activeGeneration: null,
@@ -4015,7 +4049,18 @@ export class ChatGPTBrowser {
     };
   }
 
+  assertProbeEnabled() {
+    if (!PROBE_ENABLED) {
+      throw new ChatGPTWebError("临时 Pro 身份探针默认停用；未打开临时对话，也未发送测试消息。", {
+        probeEnabled: false,
+        configuration: "CHATGPT_WEB_PROBE_ENABLED=false",
+        nextStep: "使用 requestPro=false 的普通极高路由；仅在明确需要实验性身份探针时手动启用该配置。",
+      });
+    }
+  }
+
   async probeProIdentity({ mode, force = false } = {}) {
+    this.assertProbeEnabled();
     if (!force) {
       const runtime = await readRuntimeState();
       const session = await browserSessionSnapshot();
@@ -4123,8 +4168,9 @@ export class ChatGPTBrowser {
     wait = true,
     timeoutMs = RESPONSE_TIMEOUT_MS,
   }) {
+    if (requestPro) this.assertProbeEnabled();
     if (!requestPro) {
-      await this.newChat({ temporary: false, mode }, { includeStatus: false });
+      const newConversation = await this.newChat({ temporary: false, mode }, { includeStatus: false });
       const tier = await this.selectExtremeTier(DEFAULT_ANSWER_TIER);
       const refreshResult = await this.refreshBeforeSend({ reason: "route-new-chat" });
       if (files.length) await this.uploadFiles(files);
@@ -4133,6 +4179,9 @@ export class ChatGPTBrowser {
       const result = await this.submitPrompt({ wait, timeoutMs, refresh: false });
       return {
         route: "default-extreme",
+        ...(newConversation.newChatRefresh
+          ? { newChatRefresh: newConversation.newChatRefresh }
+          : {}),
         probe: null,
         finalConversation: { tier: DEFAULT_ANSWER_TIER, temporary: false },
         tier,
@@ -4390,7 +4439,7 @@ export class ChatGPTBrowser {
     };
   }
 
-  async getLatestResponse({ includeSettings = false } = {}) {
+  async getLatestResponse({ includeSettings = false, includeTranscript = true } = {}) {
     const page = await this.page();
     const body = await page.locator("body").innerText().catch(() => "");
     const rateLimit = classifyRateLimitText(body);
@@ -4415,12 +4464,8 @@ export class ChatGPTBrowser {
           .then((value) => value > 0)
           .catch(() => false)
       : false;
-    // A completed response can occasionally leave an empty assistant
-    // placeholder in the DOM (for example after a streamed answer is
-    // finalized by the page).  Requiring non-empty text here leaves the
-    // runtime generation lock stuck forever even though the stop button and
-    // streaming marker are gone.  The assistant-node count/change is the
-    // authoritative completion signal; an empty node is still a new node.
+    // A completed response can leave an empty assistant placeholder after
+    // streaming finishes. Preserve the PR's node-count/change completion rule.
     const generationComplete = Boolean(
       runtime.activeGeneration?.active &&
         !stop &&
@@ -4440,13 +4485,21 @@ export class ChatGPTBrowser {
           : { lastGenerationInterruptedAt: Date.now() }),
       });
     }
-    const settings =
-      includeSettings &&
-      !runtime.circuitBreaker?.active &&
-      !(runtime.activeGeneration?.active && !generationComplete)
-        ? await this.advancedSettings()
-        : this.cachedSettings();
-    const transcript = stop || streaming ? null : await this.loadCompleteTranscript();
+    const generationUnconfirmed =
+      runtime.activeGeneration?.active && !generationComplete && !staleGeneration;
+    let settings = this.cachedSettings();
+    let settingsWarning = null;
+    if (includeSettings && !runtime.circuitBreaker?.active && !generationUnconfirmed) {
+      try {
+        settings = await this.advancedSettings();
+      } catch (error) {
+        settingsWarning = { message: error instanceof Error ? error.message : String(error) };
+      }
+    }
+    const transcript = includeTranscript && !stop && !streaming &&
+      !rateLimit.limited && !runtime.circuitBreaker?.active && !generationUnconfirmed
+      ? await this.loadCompleteTranscript()
+      : null;
     const userCount = transcript?.userMessageCount ?? renderedUserCount;
     const assistantCount = transcript?.assistantMessageCount ?? renderedAssistantCount;
     const latestUserText = transcript
@@ -4492,6 +4545,7 @@ export class ChatGPTBrowser {
         : runtime.circuitBreaker || null,
       model: settings.model,
       thinkingLevel: settings.thinkingLevel,
+      settingsWarning,
       mode: await this.currentMode(),
       temporary: await this.temporaryState(),
     };

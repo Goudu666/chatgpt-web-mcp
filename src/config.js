@@ -85,6 +85,19 @@ export const RECONNECT_DELAY_MS = Number(
   process.env.CHATGPT_WEB_RECONNECT_DELAY_MS || 5_000,
 );
 
+export const PAGE_STARTUP_DELAY_MS = Number(
+  process.env.CHATGPT_WEB_PAGE_STARTUP_DELAY_MS || 6_000,
+);
+
+// A second refresh is opt-in; the send path already refreshes its page.
+export const REFRESH_BEFORE_NEW_CHAT = /^(1|true|yes)$/i.test(
+  process.env.CHATGPT_WEB_REFRESH_BEFORE_NEW_CHAT || "false",
+);
+
+export const PROBE_ENABLED = /^(1|true|yes|on)$/i.test(
+  String(process.env.CHATGPT_WEB_PROBE_ENABLED || "false").trim(),
+);
+
 export const SITE_ACTION_INTERVAL_MS = Number(
   process.env.CHATGPT_WEB_SITE_ACTION_INTERVAL_MS || 5_000,
 );
@@ -94,15 +107,15 @@ export const PAGE_INTERACTION_INTERVAL_MS = Number(
 );
 
 export const SEND_INTERVAL_MS = Number(
-  process.env.CHATGPT_WEB_SEND_INTERVAL_MS || 30_000,
+  process.env.CHATGPT_WEB_SEND_INTERVAL_MS || 5_000,
 );
 
 export const CONVERSATION_CHANGE_INTERVAL_MS = Number(
-  process.env.CHATGPT_WEB_CONVERSATION_CHANGE_INTERVAL_MS || 30_000,
+  process.env.CHATGPT_WEB_CONVERSATION_CHANGE_INTERVAL_MS || 5_000,
 );
 
 export const POST_RESPONSE_CONVERSATION_COOLDOWN_MS = Number(
-  process.env.CHATGPT_WEB_POST_RESPONSE_CONVERSATION_COOLDOWN_MS || 30_000,
+  process.env.CHATGPT_WEB_POST_RESPONSE_CONVERSATION_COOLDOWN_MS || 5_000,
 );
 
 export const POST_BREAKER_COOLDOWN_MS = Number(

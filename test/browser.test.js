@@ -464,6 +464,36 @@ test("networkRateLimitScope identifies history list rate limits", () => {
   assert.equal(networkRateLimitScope("/backend-api/models"), "http-429");
 });
 
+test("history HTTP 429 is diagnostic-only while generation HTTP 429 still stops", () => {
+  const browser = new ChatGPTBrowser();
+  const handlers = new Map();
+  const diagnostics = [];
+  const breakers = [];
+  const notifications = [];
+  const page = {
+    on: (event, handler) => handlers.set(event, handler),
+    evaluate: async (_callback, detail) => notifications.push(detail),
+  };
+  browser.appendNetworkDiagnostic = async (entry) => diagnostics.push(entry);
+  browser.tripCircuitBreaker = async (scope) => breakers.push(scope);
+  browser.attachNetworkDiagnostics(page);
+  const respond = (pathname) => handlers.get("response")({
+    status: () => 429,
+    url: () => `https://chatgpt.com${pathname}`,
+    request: () => ({ method: () => "GET", resourceType: () => "fetch" }),
+  });
+
+  respond("/backend-api/conversations");
+  respond("/backend-api/conversations/example-chat");
+  assert.equal(diagnostics.length, 2);
+  assert.deepEqual(breakers, []);
+  assert.deepEqual(notifications, []);
+
+  respond("/backend-api/conversation");
+  assert.deepEqual(breakers, ["generation"]);
+  assert.equal(notifications.length, 1);
+});
+
 test("siteActionWaitMs enforces the 30 second send interval", () => {
   assert.equal(
     siteActionWaitMs(
@@ -557,6 +587,60 @@ test("dead generation owners are stale but the current process is not", () => {
     false,
   );
   assert.equal(generationIsStale({ activeGeneration: { active: true } }), false);
+});
+
+test("optional newChat refresh runs once before opening the next conversation", async () => {
+  const browser = new ChatGPTBrowser();
+  const events = [];
+  const page = {
+    url: () => "https://chatgpt.com/c/previous-chat",
+    reload: async () => events.push("reload"),
+    locator: () => ({ evaluateAll: async () => 0 }),
+  };
+  browser.page = async () => page;
+  browser.ensureSignedIn = async () => {};
+  browser.assertComposerEmpty = async () => events.push("check-draft");
+  browser.siteAction = async (action) => events.push(action);
+  browser.pageInteraction = async () => {};
+  browser.throwIfRateLimited = async () => events.push("check-rate-limit");
+  browser.openRoot = async () => {
+    events.push("open-new-chat");
+    return { temporary: false, url: "https://chatgpt.com/" };
+  };
+  const result = await browser.newChat({}, { includeStatus: false, refreshBeforeNewChat: true });
+  assert.deepEqual(events, [
+    "check-draft", "refresh-before-new-chat", "reload", "check-rate-limit", "open-new-chat",
+  ]);
+  assert.equal(result.newChatRefresh.refreshed, true);
+
+  events.length = 0;
+  await browser.newChat({}, { includeStatus: false, refreshBeforeNewChat: false });
+  assert.deepEqual(events, ["open-new-chat"]);
+});
+
+test("optional newChat refresh stops before navigation when the refresh fails", async () => {
+  const browser = new ChatGPTBrowser();
+  browser.refreshBeforeNewChat = async () => { throw new Error("reload failed"); };
+  browser.openRoot = async () => assert.fail("must not open a new conversation after a failed reload");
+  await assert.rejects(
+    () => browser.newChat({}, { includeStatus: false, refreshBeforeNewChat: true }),
+    /reload failed/,
+  );
+});
+
+test("optional refresh honors five-second spacing without shortening breaker recovery", () => {
+  const options = {
+    siteActionIntervalMs: 5_000,
+    sendIntervalMs: 5_000,
+    conversationChangeIntervalMs: 5_000,
+    postResponseConversationCooldownMs: 5_000,
+    postBreakerCooldownMs: 300_000,
+  };
+  const state = { lastGenerationCompletedAt: 98_000, lastConversationChangeAt: 97_000 };
+  assert.equal(siteActionWaitMs(state, "refresh-before-new-chat", 100_000, options), 3_000);
+  assert.equal(siteActionWaitMs({ lastSendAt: 98_000 }, "send-prompt", 100_000, options), 3_000);
+  assert.equal(siteActionWaitMs({ ...state, historyQuietUntil: 240_000 }, "refresh-before-new-chat", 100_000, options), 140_000);
+  assert.equal(siteActionWaitMs({ ...state, circuitBreakerClearedAt: 90_000, postBreakerCooldownPending: true }, "refresh-before-new-chat", 100_000, options), 290_000);
 });
 
 test("refreshBeforeSend reloads the selected conversation before sending", async () => {

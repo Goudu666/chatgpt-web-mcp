@@ -40,7 +40,7 @@ Do not add a live ChatGPT login or message-send test to CI. Live browser verific
 
 A contribution must not:
 
-- reduce default delays simply to make a test faster;
+- reduce the documented five-second operation intervals or five-minute recovery periods merely to speed up tests; timing changes must be deliberate and documented, not presented as protection from rate limits;
 - add page polling when an event-driven wait is possible;
 - automatically clear a circuit breaker, dismiss a rate-limit prompt, or retry HTTP 429;
 - fall back to repeated full-page ChatGPT reloads;
